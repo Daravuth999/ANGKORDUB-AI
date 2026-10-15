@@ -16,13 +16,10 @@ import {
   Languages,
   FileVideo,
   ShieldCheck,
-  Sliders,
   Eye,
   Upload,
   Wand2,
-  Check,
   Terminal,
-  Layers,
   RefreshCw,
   Subtitles,
   Maximize2,
@@ -33,7 +30,7 @@ import {
   SkipForward,
   ChevronDown,
   ChevronUp,
-  Users
+  Key
 } from 'lucide-react';
 import {
   DialogueSegment,
@@ -56,7 +53,6 @@ import {
   loadCheckpointFromIndexedDB,
   clearCheckpointInIndexedDB
 } from './services/storageService';
-import { generatePlayableDemoMovie } from './services/demoMovieGenerator';
 import {
   transcribeWithElevenLabsScribe2,
   fetchElevenLabsVoices,
@@ -66,7 +62,7 @@ import {
 import { runOptionalWhisperVerification } from './services/whisperVerificationService';
 import {
   localizeDialogueSegmentsWithGemini,
-  transcribeAudioWithGeminiFallback
+  GeminiBillingOrAuthError
 } from './services/geminiLocalizationService';
 import { evaluateTimelineDurationAlignment } from './services/timingEngine';
 import { assembleAndValidateFinalMovie } from './services/videoAssemblyService';
@@ -90,12 +86,12 @@ type ProductionStageTab =
 type ConciseStageStatus = 'Waiting' | 'In Progress' | 'Needs Review' | 'Completed' | 'Failed';
 
 export function App() {
-  // Project & Media State
-  const [projectName, setProjectName] = useState<string>('Angkor Expedition Reel — Dubbing Master');
+  // Project & Media State (Strictly real user-imported media)
+  const [projectName, setProjectName] = useState<string>('Untitled Dubbing Project');
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null);
   const [needsVideoReselect, setNeedsVideoReselect] = useState<boolean>(false);
-  const [videoDurationSec, setVideoDurationSec] = useState<number>(16);
+  const [videoDurationSec, setVideoDurationSec] = useState<number>(0);
   const [currentTimeSec, setCurrentTimeSec] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [expandVideoPreview, setExpandVideoPreview] = useState<boolean>(false);
@@ -121,9 +117,7 @@ export function App() {
   const [sourceLanguage, setSourceLanguage] = useState<'en' | 'km'>('en');
   const [targetLanguage, setTargetLanguage] = useState<'km' | 'en'>('km');
   const [dialogueStyle, setDialogueStyle] = useState<DialogueStyle>(DialogueStyle.EVERYDAY_KHMER);
-  const [sceneContextNotes, setSceneContextNotes] = useState<string>(
-    'Nighttime archaeological thriller outside Angkor Wat. Tense, secretive conversation between colleagues.'
-  );
+  const [sceneContextNotes, setSceneContextNotes] = useState<string>('');
 
   // Core Pipeline Data + Undo/Redo History
   const [rawScribeResponseJson, setRawScribeResponseJson] = useState<string | null>(null);
@@ -138,9 +132,14 @@ export function App() {
   const [availableVoices, setAvailableVoices] = useState<ElevenLabsVoice[]>([]);
   const [disagreements, setDisagreements] = useState<WhisperDisagreement[]>([]);
 
-  // Per-Segment Synthesis Loading & Error State
+  // Per-Segment Synthesis & Translation Loading State
   const [synthesizingSegmentId, setSynthesizingSegmentId] = useState<string | null>(null);
+  const [translatingSegmentId, setTranslatingSegmentId] = useState<string | null>(null);
   const [segmentSynthesisErrors, setSegmentSynthesisErrors] = useState<Record<string, string>>({});
+
+  // Actionable API Error Banners
+  const [localizationErrorBanner, setLocalizationErrorBanner] = useState<string | null>(null);
+  const [elevenLabsErrorBanner, setElevenLabsErrorBanner] = useState<string | null>(null);
 
   // Automated Pipeline Orchestration State
   const [isAutoPipelineRunning, setIsAutoPipelineRunning] = useState<boolean>(false);
@@ -154,11 +153,8 @@ export function App() {
   const [finalValidationReport, setFinalValidationReport] = useState<FinalValidationReport | null>(null);
   const [verificationTests, setVerificationTests] = useState<VerificationTestResult[]>([]);
 
-  // ElevenLabs 401 Unusual Activity / VPN Block Alert Banner
-  const [elevenLabsRestrictionNotice, setElevenLabsRestrictionNotice] = useState<string | null>(null);
-
   // Workspace Navigation & Modals
-  const [activeStage, setActiveStage] = useState<ProductionStageTab>('STAGE_4_VOICES_AUDITION');
+  const [activeStage, setActiveStage] = useState<ProductionStageTab>('STAGE_1_TRANSCRIBE');
   const [isConfigOpen, setIsConfigOpen] = useState<boolean>(false);
   const [showRawScribeModal, setShowRawScribeModal] = useState<boolean>(false);
 
@@ -176,8 +172,6 @@ export function App() {
           whisperModel: parsed.whisperModel || 'whisper-1',
           persistLocally: Boolean(parsed.persistLocally),
           elevenLabsTtsModel: parsed.elevenLabsTtsModel || 'eleven_multilingual_v2',
-          ttsEngineMode: parsed.ttsEngineMode || 'elevenlabs_with_fallback',
-          enableScribeFallbackToGemini: parsed.enableScribeFallbackToGemini ?? true,
           enableWhisperVerification: Boolean(parsed.enableWhisperVerification),
           lipSyncEndpointUrl: parsed.lipSyncEndpointUrl || ''
         };
@@ -193,8 +187,6 @@ export function App() {
       whisperModel: 'whisper-1',
       persistLocally: false,
       elevenLabsTtsModel: 'eleven_multilingual_v2',
-      ttsEngineMode: 'elevenlabs_with_fallback',
-      enableScribeFallbackToGemini: true,
       enableWhisperVerification: false,
       lipSyncEndpointUrl: ''
     };
@@ -202,10 +194,10 @@ export function App() {
 
   // Real Stage Progress Trackers
   const [stageProgress, setStageProgress] = useState<Record<string, StageProgress>>({
-    scribe: { status: 'waiting', operation: 'Ready for media', processed: 0, total: 1, startedAt: null, completedAt: null },
-    whisper: { status: 'waiting', operation: 'Optional verification', processed: 0, total: 1, startedAt: null, completedAt: null },
-    gemini: { status: 'waiting', operation: 'Waiting for transcript', processed: 0, total: 1, startedAt: null, completedAt: null },
-    synthesis: { status: 'waiting', operation: 'Waiting for localization', processed: 0, total: 1, startedAt: null, completedAt: null },
+    scribe: { status: 'waiting', operation: 'Import a movie file to begin', processed: 0, total: 0, startedAt: null, completedAt: null },
+    whisper: { status: 'waiting', operation: 'Optional verification', processed: 0, total: 0, startedAt: null, completedAt: null },
+    gemini: { status: 'waiting', operation: 'Waiting for transcript', processed: 0, total: 0, startedAt: null, completedAt: null },
+    synthesis: { status: 'waiting', operation: 'Waiting for localization', processed: 0, total: 0, startedAt: null, completedAt: null },
     assembly: { status: 'waiting', operation: 'Waiting for verified audio', processed: 0, total: 100, startedAt: null, completedAt: null }
   });
 
@@ -263,12 +255,17 @@ export function App() {
     appendLog('SYSTEM', 'info', 'Redid edit.');
   };
 
-  // Restore saved checkpoint from IndexedDB on mount
+  // Restore saved real project checkpoint from IndexedDB on mount
   useEffect(() => {
     let mounted = true;
     loadCheckpointFromIndexedDB().then(async (checkpoint) => {
       if (!mounted) return;
       if (checkpoint && checkpoint.segments.length > 0) {
+        if (checkpoint.sourceFileName === 'angkor_temple_expedition_reel.webm') {
+          await clearCheckpointInIndexedDB();
+          return;
+        }
+
         setProjectName(checkpoint.projectName);
         setSourceLanguage(checkpoint.sourceLanguage);
         setTargetLanguage(checkpoint.targetLanguage);
@@ -279,7 +276,7 @@ export function App() {
         setSegments(checkpoint.segments);
         setCharacters(checkpoint.characters);
         setDisagreements(checkpoint.disagreements);
-        setVideoDurationSec(checkpoint.sourceVideoDuration || 16);
+        setVideoDurationSec(checkpoint.sourceVideoDuration || 0);
         setSelectedSegmentId(checkpoint.segments[0]?.segment_id || null);
         setNeedsVideoReselect(true);
 
@@ -314,7 +311,12 @@ export function App() {
             completedAt: null
           },
           synthesis: {
-            status: measuredCount === checkpoint.segments.length ? 'completed' : measuredCount > 0 ? 'completed_with_warnings' : 'ready',
+            status:
+              measuredCount === checkpoint.segments.length
+                ? 'completed'
+                : measuredCount > 0
+                  ? 'completed_with_warnings'
+                  : 'waiting',
             operation: `Voice generation: ${measuredCount} of ${checkpoint.segments.length} audio clips generated.`,
             processed: measuredCount,
             total: checkpoint.segments.length,
@@ -334,18 +336,18 @@ export function App() {
         appendLog(
           'SYSTEM',
           'info',
-          `Restored project "${checkpoint.projectName}" (${checkpoint.segments.length} segments, ${measuredCount} audio clips) from IndexedDB.`
+          `Restored project "${checkpoint.projectName}" (${checkpoint.segments.length} segments, ${localizedCount} localized, ${measuredCount} audio clips).`
         );
-      } else {
-        await handleLoadVerifiedDemoReel();
       }
     });
 
-    fetchElevenLabsVoices(credentials.elevenLabsApiKey)
-      .then((v) => {
-        if (mounted) setAvailableVoices(v);
-      })
-      .catch(() => {});
+    if (credentials.elevenLabsApiKey.trim()) {
+      fetchElevenLabsVoices(credentials.elevenLabsApiKey)
+        .then((v) => {
+          if (mounted) setAvailableVoices(v);
+        })
+        .catch(() => {});
+    }
 
     return () => {
       mounted = false;
@@ -388,7 +390,6 @@ export function App() {
     logs
   ]);
 
-  // Synchronized Dubbed Audio Monitor during video preview when "dubbed_audio" monitor mode is active
   useEffect(() => {
     if (!videoRef.current) return;
     videoRef.current.muted = subtitleConfig.audioMonitorSource === 'dubbed_audio';
@@ -423,7 +424,6 @@ export function App() {
     }
   };
 
-  // Play exact original video/audio window for a segment (for A/B comparison)
   const handlePlayOriginalWindow = (seg: DialogueSegment) => {
     if (!videoRef.current) return;
     if (sliceStopTimeoutRef.current) {
@@ -444,102 +444,41 @@ export function App() {
 
   const handleSaveCredentials = (updated: ApiCredentials) => {
     setCredentials(updated);
-    setElevenLabsRestrictionNotice(null);
+    setLocalizationErrorBanner(null);
+    setElevenLabsErrorBanner(null);
     if (updated.persistLocally) {
       localStorage.setItem('angkordub_credentials_v2', JSON.stringify(updated));
     } else {
       localStorage.removeItem('angkordub_credentials_v2');
     }
-    fetchElevenLabsVoices(updated.elevenLabsApiKey)
-      .then((voices) => {
-        setAvailableVoices(voices);
-        appendLog('VOICE_VAULT', 'success', `Synced ${voices.length} voices from ElevenLabs.`);
-      })
-      .catch((err) => {
-        appendLog('VOICE_VAULT', 'warning', `Voice sync note: ${err.message}`);
-      });
-  };
+    if (updated.elevenLabsApiKey.trim()) {
+      fetchElevenLabsVoices(updated.elevenLabsApiKey)
+        .then((voices) => {
+          setAvailableVoices(voices);
+          if (voices.length > 0) {
+            setCharacters((prev) =>
+              prev.map((c, idx) =>
+                !c.assigned_voice_id
+                  ? {
+                      ...c,
+                      assigned_voice_id: voices[idx % voices.length].voice_id,
+                      assigned_voice_name: voices[idx % voices.length].name
+                    }
+                  : c
+              )
+            );
+          }
+          appendLog('VOICE_VAULT', 'success', `Synced ${voices.length} voices from ElevenLabs.`);
+        })
+        .catch((err) => {
+          appendLog('VOICE_VAULT', 'error', `ElevenLabs voice sync failed: ${err.message}`);
+        });
+    }
 
-  // Load Playable Verified Sample Movie with pre-generated Khmer translations & measurable audio
-  const handleLoadVerifiedDemoReel = async () => {
-    try {
-      setStageProgress((p) => ({
-        ...p,
-        scribe: {
-          status: 'running',
-          operation: 'Loading playable sample movie, Khmer translations & synthesized audio...',
-          processed: 0,
-          total: 4,
-          startedAt: Date.now(),
-          completedAt: null
-        }
-      }));
-      const bundle = await generatePlayableDemoMovie((msg) => {
-        appendLog('SCRIBE', 'info', msg);
-      });
-
-      setSourceFile(bundle.videoFile);
-      setSourceVideoUrl(bundle.videoUrl);
-      setNeedsVideoReselect(false);
-      setVideoDurationSec(bundle.durationSec);
-      setRawScribeResponseJson(JSON.stringify(bundle.rawScribePayload, null, 2));
-      setSegments(bundle.segments);
-      setCharacters(bundle.characters);
-      setDisagreements(bundle.sampleDisagreements);
-      setSelectedSegmentId(bundle.segments[0]?.segment_id || null);
-      setFinalValidationReport(null);
-
-      setStageProgress({
-        scribe: {
-          status: 'completed',
-          operation: `Transcription: ${bundle.segments.length} of ${bundle.segments.length} segments complete.`,
-          processed: bundle.segments.length,
-          total: bundle.segments.length,
-          startedAt: Date.now(),
-          completedAt: Date.now()
-        },
-        whisper: {
-          status: 'completed',
-          operation: `${bundle.characters.length} speakers verified`,
-          processed: bundle.characters.length,
-          total: bundle.characters.length,
-          startedAt: Date.now(),
-          completedAt: Date.now()
-        },
-        gemini: {
-          status: 'completed',
-          operation: `Localization: ${bundle.segments.length} of ${bundle.segments.length} segments complete.`,
-          processed: bundle.segments.length,
-          total: bundle.segments.length,
-          startedAt: Date.now(),
-          completedAt: Date.now()
-        },
-        synthesis: {
-          status: 'completed',
-          operation: `Voice generation: ${bundle.segments.length} of ${bundle.segments.length} audio clips generated.`,
-          processed: bundle.segments.length,
-          total: bundle.segments.length,
-          startedAt: Date.now(),
-          completedAt: Date.now()
-        },
-        assembly: {
-          status: 'ready',
-          operation: 'Ready to assemble and export movie',
-          processed: 0,
-          total: 100,
-          startedAt: null,
-          completedAt: null
-        }
-      });
-
-      appendLog(
-        'SCRIBE',
-        'success',
-        `Loaded sample movie "${bundle.videoFile.name}" with ${bundle.segments.length} Khmer segments and ready-to-audition audio clips.`
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      appendLog('SCRIBE', 'error', `Failed to generate demo movie: ${msg}`);
+    // If Stage 3 was previously failed or waiting on untranslated segments, automatically resume localization
+    const hasUntranslated = segments.some((s) => !s.active_target_text.trim());
+    if (segments.length > 0 && (stageProgress.gemini.status === 'failed' || hasUntranslated)) {
+      handleRunGeminiLocalization(segments, updated.customGeminiApiKey);
     }
   };
 
@@ -552,104 +491,24 @@ export function App() {
     setSourceVideoUrl(url);
     setNeedsVideoReselect(false);
     setProjectName(file.name.replace(/\.[^/.]+$/, ''));
-    setActiveStage('STAGE_1_TRANSCRIBE');
-    setStageProgress((p) => ({
-      ...p,
-      scribe: {
-        status: 'ready',
-        operation: `Ready to transcribe "${file.name}"`,
-        processed: 0,
-        total: 1,
-        startedAt: null,
-        completedAt: null
-      }
-    }));
-    appendLog('SYSTEM', 'info', `Imported movie "${file.name}" (${(file.size / 1024 / 1024).toFixed(2)} MB).`);
-  };
-
-  // Gemini Audio Transcription Fallback
-  const handleRunGeminiAudioTranscription = async (): Promise<DialogueSegment[] | null> => {
-    if (!sourceFile) {
-      appendLog('SCRIBE', 'error', 'Please import a movie file first.');
-      return null;
-    }
-
-    try {
+    if (segments.length === 0) {
+      setActiveStage('STAGE_1_TRANSCRIBE');
       setStageProgress((p) => ({
         ...p,
         scribe: {
-          status: 'running',
-          operation: `Transcribing ${sourceLanguage === 'km' ? 'Khmer' : 'English'} audio via Gemini 2.5 Flash...`,
+          status: 'ready',
+          operation: `Ready to transcribe "${file.name}"`,
           processed: 0,
           total: 1,
-          startedAt: Date.now(),
-          completedAt: null
-        }
-      }));
-
-      const result = await transcribeAudioWithGeminiFallback(
-        sourceFile,
-        sourceLanguage,
-        (op) => {
-          setStageProgress((p) => ({
-            ...p,
-            scribe: { ...p.scribe, operation: op }
-          }));
-          appendLog('SCRIBE', 'info', op);
-        },
-        credentials.customGeminiApiKey
-      );
-
-      setRawScribeResponseJson(result.rawResponseJson);
-      setSourceLanguage(result.detectedLanguage);
-      setTargetLanguage(result.detectedLanguage === 'en' ? 'km' : 'en');
-      setSegments(result.segments);
-      setCharacters(result.characters);
-      setSelectedSegmentId(result.segments[0]?.segment_id || null);
-
-      setStageProgress((p) => ({
-        ...p,
-        scribe: {
-          status: 'completed',
-          operation: `Transcription: ${result.segments.length} of ${result.segments.length} segments complete.`,
-          processed: result.segments.length,
-          total: result.segments.length,
-          startedAt: p.scribe.startedAt,
-          completedAt: Date.now()
-        },
-        gemini: {
-          status: 'ready',
-          operation: `Localization: 0 of ${result.segments.length} segments complete.`,
-          processed: 0,
-          total: result.segments.length,
           startedAt: null,
           completedAt: null
         }
       }));
-
-      appendLog(
-        'SCRIBE',
-        'success',
-        `Transcription complete: ${result.segments.length} segments and ${result.characters.length} speakers identified.`
-      );
-      return result.segments;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setStageProgress((p) => ({
-        ...p,
-        scribe: {
-          ...p.scribe,
-          status: 'failed',
-          operation: 'Transcription failed',
-          errorMessage: msg
-        }
-      }));
-      appendLog('SCRIBE', 'error', `Transcription failed: ${msg}`);
-      return null;
     }
+    appendLog('SYSTEM', 'info', `Loaded movie "${file.name}" (${(file.size / 1024 / 1024).toFixed(2)} MB).`);
   };
 
-  // Primary Scribe v2 Transcription with auto-fallback
+  // Primary Scribe v2 Transcription
   const handleRunLiveScribe2 = async (): Promise<DialogueSegment[] | null> => {
     if (!sourceFile) {
       appendLog('SCRIBE', 'error', 'Please import a movie file first.');
@@ -657,19 +516,19 @@ export function App() {
     }
 
     if (!credentials.elevenLabsApiKey.trim()) {
-      if (credentials.enableScribeFallbackToGemini) {
-        return await handleRunGeminiAudioTranscription();
-      }
       setIsConfigOpen(true);
+      appendLog('SCRIBE', 'error', 'ElevenLabs API key is required for Scribe v2 transcription.');
       return null;
     }
+
+    setElevenLabsErrorBanner(null);
 
     try {
       setStageProgress((p) => ({
         ...p,
         scribe: {
           status: 'running',
-          operation: `Transcribing with ElevenLabs Scribe v2...`,
+          operation: 'Transcribing with ElevenLabs Scribe v2...',
           processed: 0,
           total: 1,
           startedAt: Date.now(),
@@ -690,11 +549,34 @@ export function App() {
         }
       );
 
+      let voicesToUse = availableVoices;
+      if (voicesToUse.length === 0 && credentials.elevenLabsApiKey.trim()) {
+        try {
+          voicesToUse = await fetchElevenLabsVoices(credentials.elevenLabsApiKey);
+          setAvailableVoices(voicesToUse);
+        } catch {
+          // keep empty if fetch fails
+        }
+      }
+
+      const assignedChars = result.characters.map((c, idx) => {
+        if (voicesToUse.length > 0 && !c.assigned_voice_id) {
+          const v = voicesToUse[idx % voicesToUse.length];
+          return {
+            ...c,
+            assigned_voice_id: v.voice_id,
+            assigned_voice_name: v.name,
+            is_voice_locked: true
+          };
+        }
+        return c;
+      });
+
       setRawScribeResponseJson(result.rawResponseJson);
       setSourceLanguage(result.detectedLanguage);
       setTargetLanguage(result.detectedLanguage === 'en' ? 'km' : 'en');
       setSegments(result.segments);
-      setCharacters(result.characters);
+      setCharacters(assignedChars);
       setSelectedSegmentId(result.segments[0]?.segment_id || null);
 
       setStageProgress((p) => ({
@@ -717,17 +599,17 @@ export function App() {
         }
       }));
 
+      appendLog(
+        'SCRIBE',
+        'success',
+        `Scribe v2 completed: ${result.segments.length} segments and ${assignedChars.length} speakers extracted.`
+      );
       return result.segments;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (err instanceof ElevenLabsAccountRestrictionError && err.isUnusualActivityBlock) {
-        setElevenLabsRestrictionNotice(err.message);
+      if (err instanceof ElevenLabsAccountRestrictionError) {
+        setElevenLabsErrorBanner(err.message);
       }
-
-      if (credentials.enableScribeFallbackToGemini) {
-        return await handleRunGeminiAudioTranscription();
-      }
-
       setStageProgress((p) => ({
         ...p,
         scribe: {
@@ -747,7 +629,8 @@ export function App() {
     if (segments.length === 0) return;
 
     if (!credentials.whisperApiKey.trim()) {
-      appendLog('WHISPER', 'info', 'Showing Scribe v2 vs. Whisper reconciliation items.');
+      setIsConfigOpen(true);
+      appendLog('WHISPER', 'warning', 'Enter your Whisper API key in Settings to run second-pass verification.');
       return;
     }
 
@@ -832,12 +715,67 @@ export function App() {
     );
   };
 
-  // Stage 3: Gemini Cambodian Khmer Localization
+  // Single-Segment Khmer Localization
+  const handleLocalizeSingleSegment = async (segmentId: string) => {
+    const targetSeg = segments.find((s) => s.segment_id === segmentId);
+    if (!targetSeg) return;
+
+    setTranslatingSegmentId(segmentId);
+    setLocalizationErrorBanner(null);
+
+    try {
+      const resList = await localizeDialogueSegmentsWithGemini({
+        segments: [targetSeg],
+        characters,
+        dialogueStyle,
+        sceneContextNotes,
+        customGeminiApiKey: credentials.customGeminiApiKey
+      });
+
+      const loc = resList[0];
+      if (loc) {
+        commitSegmentsUpdate((prev) =>
+          prev.map((seg) =>
+            seg.segment_id === segmentId
+              ? {
+                  ...seg,
+                  translated_text: loc.translated_text,
+                  literal_meaning: loc.literal_meaning,
+                  natural_spoken_version: loc.natural_spoken_version,
+                  shorter_dubbing_version: loc.shorter_dubbing_version,
+                  selected_version_type: 'natural',
+                  active_target_text: loc.natural_spoken_version,
+                  emotion_direction: loc.emotion_direction,
+                  delivery_notes: loc.delivery_notes,
+                  estimated_speech_duration: loc.estimated_speech_duration,
+                  review_required: loc.review_required,
+                  review_reason: loc.review_reason,
+                  needs_retranslation: false,
+                  needs_resynthesis: true
+                }
+              : seg
+          )
+        );
+        appendLog('GEMINI', 'success', `Localized ${segmentId} into natural spoken Khmer.`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setLocalizationErrorBanner(msg);
+      appendLog('GEMINI', 'error', `Failed to localize ${segmentId}: ${msg}`);
+    } finally {
+      setTranslatingSegmentId(null);
+    }
+  };
+
+  // Stage 3: Full Cambodian Khmer Localization with Progressive Batch Saving
   const handleRunGeminiLocalization = async (
-    overrideSegments?: DialogueSegment[]
+    overrideSegments?: DialogueSegment[],
+    overrideGeminiKey?: string
   ): Promise<DialogueSegment[] | null> => {
     const workingInput = overrideSegments || segments;
     if (workingInput.length === 0) return null;
+
+    setLocalizationErrorBanner(null);
 
     try {
       setStageProgress((p) => ({
@@ -852,12 +790,15 @@ export function App() {
         }
       }));
 
+      let progressiveSegments = [...workingInput];
+
       const localizedList = await localizeDialogueSegmentsWithGemini({
         segments: workingInput,
         characters,
         dialogueStyle,
         sceneContextNotes,
-        customGeminiApiKey: credentials.customGeminiApiKey,
+        customGeminiApiKey:
+          overrideGeminiKey !== undefined ? overrideGeminiKey : credentials.customGeminiApiKey,
         onSegmentProgress: (done, total, segId) => {
           setStageProgress((p) => ({
             ...p,
@@ -869,51 +810,54 @@ export function App() {
               operation: `Localization: ${done} of ${total} segments complete.`
             }
           }));
+        },
+        onBatchLocalized: (batchResults) => {
+          const batchMap = new Map(batchResults.map((item) => [item.segment_id, item]));
+          progressiveSegments = progressiveSegments.map((seg) => {
+            const loc = batchMap.get(seg.segment_id);
+            if (!loc) return seg;
+            const textChanged = seg.active_target_text !== loc.natural_spoken_version;
+            return {
+              ...seg,
+              translated_text: loc.translated_text,
+              literal_meaning: loc.literal_meaning,
+              natural_spoken_version: loc.natural_spoken_version,
+              shorter_dubbing_version: loc.shorter_dubbing_version,
+              selected_version_type: 'natural' as const,
+              active_target_text: loc.natural_spoken_version,
+              emotion_direction: loc.emotion_direction,
+              delivery_notes: loc.delivery_notes,
+              estimated_speech_duration: loc.estimated_speech_duration,
+              review_required: loc.review_required,
+              review_reason: loc.review_reason,
+              needs_retranslation: false,
+              needs_resynthesis: textChanged || !seg.synthesized_audio_base64
+            };
+          });
+          setSegments(progressiveSegments);
         }
       });
-
-      const locMap = new Map(localizedList.map((item) => [item.segment_id, item]));
-
-      const updatedSegments = workingInput.map((seg) => {
-        const loc = locMap.get(seg.segment_id);
-        if (!loc) return seg;
-        const textChanged = seg.active_target_text !== loc.natural_spoken_version;
-        return {
-          ...seg,
-          translated_text: loc.translated_text,
-          literal_meaning: loc.literal_meaning,
-          natural_spoken_version: loc.natural_spoken_version,
-          shorter_dubbing_version: loc.shorter_dubbing_version,
-          selected_version_type: 'natural' as const,
-          active_target_text: loc.natural_spoken_version,
-          emotion_direction: loc.emotion_direction,
-          delivery_notes: loc.delivery_notes,
-          estimated_speech_duration: loc.estimated_speech_duration,
-          review_required: loc.review_required,
-          review_reason: loc.review_reason,
-          needs_retranslation: false,
-          needs_resynthesis: textChanged || !seg.synthesized_audio_base64
-        };
-      });
-
-      setSegments(updatedSegments);
 
       setStageProgress((p) => ({
         ...p,
         gemini: {
           status: 'completed',
-          operation: `Localization: ${updatedSegments.length} of ${updatedSegments.length} segments complete.`,
-          processed: updatedSegments.length,
-          total: updatedSegments.length,
+          operation: `Localization: ${progressiveSegments.length} of ${progressiveSegments.length} segments complete.`,
+          processed: progressiveSegments.length,
+          total: progressiveSegments.length,
           startedAt: p.gemini.startedAt,
           completedAt: Date.now()
         }
       }));
 
       appendLog('GEMINI', 'success', `Localized ${localizedList.length} segments into natural spoken Khmer.`);
-      return updatedSegments;
+      return progressiveSegments;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      setLocalizationErrorBanner(msg);
+      if (err instanceof GeminiBillingOrAuthError && err.requiresCustomKey) {
+        setIsConfigOpen(true);
+      }
       setStageProgress((p) => ({
         ...p,
         gemini: { ...p.gemini, status: 'failed', operation: 'Localization failed', errorMessage: msg }
@@ -928,11 +872,19 @@ export function App() {
     const seg = segments.find((s) => s.segment_id === segmentId);
     if (!seg) return;
 
-    const textToSpeak = seg.active_target_text || seg.natural_spoken_version || seg.original_text;
+    const textToSpeak = (seg.active_target_text || seg.natural_spoken_version).trim();
+    if (!textToSpeak) {
+      const errMsg = `Segment ${segmentId} has not been localized to Khmer yet. Click "Translate Line" or "Translate All with Gemini" first.`;
+      setSegmentSynthesisErrors((prev) => ({ ...prev, [segmentId]: errMsg }));
+      appendLog('TTS_TIMING', 'error', errMsg);
+      return;
+    }
+
     const charProfile = characters.find((c) => c.character_id === seg.character_id);
-    const voiceId = charProfile?.assigned_voice_id || 'pNInz6obpgDQGcFmaJgB';
+    const voiceId = charProfile?.assigned_voice_id || availableVoices[0]?.voice_id || '';
 
     setSynthesizingSegmentId(segmentId);
+    setElevenLabsErrorBanner(null);
     setSegmentSynthesisErrors((prev) => {
       const next = { ...prev };
       delete next[segmentId];
@@ -944,13 +896,8 @@ export function App() {
         text: textToSpeak,
         voiceId,
         apiKey: credentials.elevenLabsApiKey,
-        modelId: credentials.elevenLabsTtsModel,
-        ttsEngineMode: credentials.ttsEngineMode
+        modelId: credentials.elevenLabsTtsModel
       });
-
-      if (ttsResult.fallbackReason) {
-        setElevenLabsRestrictionNotice(ttsResult.fallbackReason);
-      }
 
       commitSegmentsUpdate((prev) => {
         const updated = prev.map((item) =>
@@ -994,13 +941,13 @@ export function App() {
       appendLog(
         'TTS_TIMING',
         'success',
-        `Generated audio for ${seg.segment_id} (${ttsResult.actualDurationSeconds.toFixed(2)}s). Ready for immediate audition.`
+        `Generated ElevenLabs audio for ${seg.segment_id} (${ttsResult.actualDurationSeconds.toFixed(2)}s). Ready for immediate audition.`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setSegmentSynthesisErrors((prev) => ({ ...prev, [segmentId]: msg }));
-      if (err instanceof ElevenLabsAccountRestrictionError && err.isUnusualActivityBlock) {
-        setElevenLabsRestrictionNotice(err.message);
+      if (err instanceof ElevenLabsAccountRestrictionError) {
+        setElevenLabsErrorBanner(err.message);
       }
       appendLog('TTS_TIMING', 'error', `Failed to synthesize ${segmentId}: ${msg}`);
     } finally {
@@ -1008,23 +955,48 @@ export function App() {
     }
   };
 
-  // Batch Synthesis for All Unapproved or Outdated Segments
+  // Batch Synthesis for All Localized Unapproved Segments
   const handleSynthesizeAllUnapprovedSegments = async (
     overrideSegments?: DialogueSegment[]
   ): Promise<DialogueSegment[] | null> => {
     const baseSegments = overrideSegments || segments;
     if (baseSegments.length === 0) return null;
 
-    const toProcess = baseSegments.filter(
+    if (!credentials.elevenLabsApiKey.trim()) {
+      setIsConfigOpen(true);
+      appendLog('TTS_TIMING', 'error', 'ElevenLabs API key is required to generate voice audio.');
+      return null;
+    }
+
+    const localizedCandidates = baseSegments.filter((s) =>
+      Boolean((s.active_target_text || s.natural_spoken_version).trim())
+    );
+
+    if (localizedCandidates.length === 0) {
+      const errMsg = 'Cannot generate voice audio before Khmer localization completes. Please translate the dialogue in Stage 3 first.';
+      appendLog('TTS_TIMING', 'error', errMsg);
+      setStageProgress((p) => ({
+        ...p,
+        synthesis: {
+          ...p.synthesis,
+          status: 'waiting',
+          operation: 'Waiting for Khmer localization'
+        }
+      }));
+      return null;
+    }
+
+    const toProcess = localizedCandidates.filter(
       (s) => !s.is_locked_approved && (!s.synthesized_audio_base64 || s.needs_resynthesis)
     );
-    const targetBatch = toProcess.length > 0 ? toProcess : baseSegments.filter((s) => !s.is_locked_approved);
+    const targetBatch = toProcess.length > 0 ? toProcess : localizedCandidates.filter((s) => !s.is_locked_approved);
 
     if (targetBatch.length === 0) {
-      appendLog('TTS_TIMING', 'info', 'All segments are already generated and approved.');
+      appendLog('TTS_TIMING', 'info', 'All localized segments are already generated and approved.');
       return baseSegments;
     }
 
+    setElevenLabsErrorBanner(null);
     setStageProgress((p) => ({
       ...p,
       synthesis: {
@@ -1038,17 +1010,15 @@ export function App() {
     }));
 
     let workingSegments = [...baseSegments];
-    let circuitBreakerTriggered = false;
-    let activeMode = credentials.ttsEngineMode;
 
     for (let i = 0; i < targetBatch.length; i++) {
       if (cancelPipelineRef.current) break;
 
       const seg = targetBatch[i];
       setSynthesizingSegmentId(seg.segment_id);
-      const textToSpeak = seg.active_target_text || seg.natural_spoken_version || seg.original_text;
+      const textToSpeak = (seg.active_target_text || seg.natural_spoken_version).trim();
       const charProfile = characters.find((c) => c.character_id === seg.character_id);
-      const voiceId = charProfile?.assigned_voice_id || 'pNInz6obpgDQGcFmaJgB';
+      const voiceId = charProfile?.assigned_voice_id || availableVoices[0]?.voice_id || '';
 
       setStageProgress((p) => ({
         ...p,
@@ -1065,15 +1035,8 @@ export function App() {
           text: textToSpeak,
           voiceId,
           apiKey: credentials.elevenLabsApiKey,
-          modelId: credentials.elevenLabsTtsModel,
-          ttsEngineMode: activeMode
+          modelId: credentials.elevenLabsTtsModel
         });
-
-        if (ttsResult.fallbackReason && !circuitBreakerTriggered) {
-          circuitBreakerTriggered = true;
-          activeMode = 'local_acoustic_synth';
-          setElevenLabsRestrictionNotice(ttsResult.fallbackReason);
-        }
 
         workingSegments = workingSegments.map((item) =>
           item.segment_id === seg.segment_id
@@ -1094,7 +1057,7 @@ export function App() {
         setSegmentSynthesisErrors((prev) => ({ ...prev, [seg.segment_id]: msg }));
         appendLog('TTS_TIMING', 'error', `Error on ${seg.segment_id}: ${msg}`);
         if (err instanceof ElevenLabsAccountRestrictionError) {
-          setElevenLabsRestrictionNotice(err.message);
+          setElevenLabsErrorBanner(err.message);
           break;
         }
       }
@@ -1111,7 +1074,12 @@ export function App() {
     setStageProgress((p) => ({
       ...p,
       synthesis: {
-        status: timingReport.failedOverflowCount > 0 ? 'completed_with_warnings' : 'completed',
+        status:
+          readyCount === 0
+            ? 'failed'
+            : timingReport.failedOverflowCount > 0
+              ? 'completed_with_warnings'
+              : 'completed',
         operation: `Voice generation: ${readyCount} of ${timingReport.updatedSegments.length} audio clips generated.`,
         processed: readyCount,
         total: timingReport.updatedSegments.length,
@@ -1128,7 +1096,7 @@ export function App() {
       }
     }));
 
-    return timingReport.updatedSegments;
+    return readyCount > 0 ? timingReport.updatedSegments : null;
   };
 
   const handleAutoFitAllOverflows = () => {
@@ -1234,6 +1202,11 @@ export function App() {
       return;
     }
 
+    if (!sourceFile && segments.length === 0) {
+      appendLog('SYSTEM', 'error', 'Please import a movie file before starting Auto-Run.');
+      return;
+    }
+
     cancelPipelineRef.current = false;
     setIsAutoPipelineRunning(true);
 
@@ -1244,7 +1217,6 @@ export function App() {
         setActiveStage('STAGE_1_TRANSCRIBE');
         const transcribed = await handleRunLiveScribe2();
         if (!transcribed || cancelPipelineRef.current) {
-          setIsAutoPipelineRunning(false);
           return;
         }
         currentSegs = transcribed;
@@ -1255,7 +1227,6 @@ export function App() {
         setActiveStage('STAGE_3_LOCALIZE_KHMER');
         const localized = await handleRunGeminiLocalization(currentSegs);
         if (!localized || cancelPipelineRef.current) {
-          setIsAutoPipelineRunning(false);
           return;
         }
         currentSegs = localized;
@@ -1268,7 +1239,6 @@ export function App() {
         setActiveStage('STAGE_4_VOICES_AUDITION');
         const synthesized = await handleSynthesizeAllUnapprovedSegments(currentSegs);
         if (!synthesized || cancelPipelineRef.current) {
-          setIsAutoPipelineRunning(false);
           return;
         }
         currentSegs = synthesized;
@@ -1290,8 +1260,9 @@ export function App() {
     newEnd: number,
     target: 'dubbed' | 'source'
   ) => {
-    const clampedStart = Math.max(0, Math.min(videoDurationSec - 0.25, Number(newStart.toFixed(2))));
-    const clampedEnd = Math.max(clampedStart + 0.25, Math.min(videoDurationSec, Number(newEnd.toFixed(2))));
+    const safeMaxDur = Math.max(videoDurationSec, 1);
+    const clampedStart = Math.max(0, Math.min(safeMaxDur - 0.25, Number(newStart.toFixed(2))));
+    const clampedEnd = Math.max(clampedStart + 0.25, Math.min(safeMaxDur, Number(newEnd.toFixed(2))));
 
     commitSegmentsUpdate((prev) => {
       const updated = prev.map((seg) => {
@@ -1464,13 +1435,8 @@ export function App() {
         text: sampleKhmerLine,
         voiceId: char.assigned_voice_id,
         apiKey: credentials.elevenLabsApiKey,
-        modelId: credentials.elevenLabsTtsModel,
-        ttsEngineMode: credentials.ttsEngineMode
+        modelId: credentials.elevenLabsTtsModel
       });
-
-      if (res.fallbackReason) {
-        setElevenLabsRestrictionNotice(res.fallbackReason);
-      }
 
       setCharacters((prev) =>
         prev.map((c) =>
@@ -1481,6 +1447,9 @@ export function App() {
       playBase64Audio(res.audioBase64, res.mimeType);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof ElevenLabsAccountRestrictionError) {
+        setElevenLabsErrorBanner(err.message);
+      }
       appendLog('VOICE_VAULT', 'error', `Voice audition failed: ${msg}`);
     }
   };
@@ -1490,7 +1459,7 @@ export function App() {
     const raw = base64.trim();
     audioPreviewRef.current.src = raw.startsWith('data:')
       ? raw
-      : `data:${mimeType || 'audio/wav'};base64,${raw}`;
+      : `data:${mimeType || 'audio/mpeg'};base64,${raw}`;
     audioPreviewRef.current.playbackRate = playbackRate;
     audioPreviewRef.current.play().catch(() => {});
   };
@@ -1536,7 +1505,6 @@ export function App() {
   ).length;
   const unassignedVoicesCount = characters.filter((c) => !c.assigned_voice_id).length;
 
-  // Overall real progress percentage across the 4 core milestones
   const overallProgressPct =
     totalSegs === 0
       ? 0
@@ -1546,7 +1514,6 @@ export function App() {
             100
         );
 
-  // Ordered 6-Stage Production Path Definitions with Concise Statuses
   const orderedStages: Array<{
     id: ProductionStageTab;
     stepNum: number;
@@ -1566,34 +1533,41 @@ export function App() {
             : totalSegs > 0
               ? 'Completed'
               : 'Waiting',
-      summary: totalSegs > 0 ? `${totalSegs} of ${totalSegs} segments` : 'Waiting for media'
+      summary: totalSegs > 0 ? `${totalSegs} of ${totalSegs} segments` : 'Import movie'
     },
     {
       id: 'STAGE_2_SPEAKERS',
       stepNum: 2,
       label: 'Verify Speakers',
       status:
-        unassignedVoicesCount > 0 || disagreements.some((d) => !d.resolved)
-          ? 'Needs Review'
-          : characters.length > 0
-            ? 'Completed'
-            : 'Waiting',
-      summary: `${characters.length} speakers • ${disagreements.filter((d) => !d.resolved).length} diffs`
+        totalSegs === 0
+          ? 'Waiting'
+          : unassignedVoicesCount > 0 || disagreements.some((d) => !d.resolved)
+            ? 'Needs Review'
+            : characters.length > 0
+              ? 'Completed'
+              : 'Waiting',
+      summary:
+        totalSegs === 0
+          ? 'Waiting for transcript'
+          : `${characters.length} speakers • ${disagreements.filter((d) => !d.resolved).length} diffs`
     },
     {
       id: 'STAGE_3_LOCALIZE_KHMER',
       stepNum: 3,
       label: 'Localize to Khmer',
       status:
-        stageProgress.gemini.status === 'running'
+        stageProgress.gemini.status === 'running' || Boolean(translatingSegmentId)
           ? 'In Progress'
           : stageProgress.gemini.status === 'failed'
             ? 'Failed'
-            : localizedSegsCount === totalSegs && totalSegs > 0
-              ? 'Completed'
-              : localizedSegsCount > 0
-                ? 'Needs Review'
-                : 'Waiting',
+            : totalSegs === 0
+              ? 'Waiting'
+              : localizedSegsCount === totalSegs
+                ? 'Completed'
+                : localizedSegsCount > 0
+                  ? 'Needs Review'
+                  : 'Waiting',
       summary: `${localizedSegsCount} of ${totalSegs} translated`
     },
     {
@@ -1603,13 +1577,17 @@ export function App() {
       status:
         stageProgress.synthesis.status === 'running' || Boolean(synthesizingSegmentId)
           ? 'In Progress'
-          : outdatedAudioClipsCount > 0
-            ? 'Needs Review'
-            : validAudioClipsCount === totalSegs && totalSegs > 0
-              ? 'Completed'
-              : validAudioClipsCount > 0
+          : stageProgress.synthesis.status === 'failed'
+            ? 'Failed'
+            : totalSegs === 0
+              ? 'Waiting'
+              : outdatedAudioClipsCount > 0
                 ? 'Needs Review'
-                : 'Waiting',
+                : validAudioClipsCount === totalSegs
+                  ? 'Completed'
+                  : validAudioClipsCount > 0
+                    ? 'Needs Review'
+                    : 'Waiting',
       summary: `${validAudioClipsCount} of ${totalSegs} audio clips ready`
     },
     {
@@ -1651,7 +1629,6 @@ export function App() {
     }
   ];
 
-  // Active live subtitle segment based on current video playback time
   const activePlaybackSegment =
     segments.find((s) => {
       const start =
@@ -1673,7 +1650,6 @@ export function App() {
 
   return (
     <div className="h-screen w-screen flex flex-col bg-[#0B0C10] text-[#F1F5F9] overflow-hidden select-none">
-      {/* Hidden Audio Preview Element for Live Video Monitor Dubbed Track */}
       <audio ref={audioPreviewRef} className="hidden" />
 
       {/* AREA A: SIMPLIFIED PRODUCTION HEADER */}
@@ -1685,9 +1661,11 @@ export function App() {
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <h1 className="text-sm font-bold tracking-tight text-white truncate">{projectName}</h1>
-              <span className="px-2 py-0.5 text-[11px] font-medium rounded bg-white/5 text-slate-300 border border-white/10 shrink-0">
-                {sourceFile?.name || 'Sample Reel'}
-              </span>
+              {sourceFile && (
+                <span className="px-2 py-0.5 text-[11px] font-medium rounded bg-white/5 text-slate-300 border border-white/10 shrink-0">
+                  {sourceFile.name}
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-3 text-[11px] text-slate-400">
               <span>
@@ -1806,7 +1784,7 @@ export function App() {
           >
             <FlaskConical className="w-3.5 h-3.5 text-[#D4AF37]" />
             <span>Audit & QA</span>
-            {( totalSegs - validAudioClipsCount > 0 || overflowSegsCount > 0 ) && (
+            {(totalSegs - validAudioClipsCount > 0 || overflowSegsCount > 0) && (
               <span className="px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 text-[10px]">
                 {totalSegs - validAudioClipsCount + overflowSegsCount}
               </span>
@@ -1827,25 +1805,61 @@ export function App() {
         </div>
       </nav>
 
-      {/* Actionable Notice Banner if ElevenLabs 401 Free Tier VPN Restriction Occurred */}
-      {elevenLabsRestrictionNotice && (
-        <div className="bg-amber-500/15 border-b border-amber-500/35 px-5 py-1.5 flex items-center justify-between gap-4 text-xs text-amber-200 shrink-0">
-          <div className="flex items-center gap-2 truncate">
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span className="truncate">
-              <strong>ElevenLabs Free Tier VPN Restriction Handled:</strong> Built-in Acoustic Synthesizer & Gemini 2.5 Flash fallback are active so you can audition and export without interruption.
-            </span>
+      {/* Actionable Error Banner for Gemini Localization */}
+      {localizationErrorBanner && (
+        <div className="bg-rose-500/15 border-b border-rose-500/40 px-5 py-2 flex flex-wrap items-center justify-between gap-3 text-xs text-rose-200 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span className="truncate">{localizationErrorBanner}</span>
           </div>
-          <button
-            onClick={() => setElevenLabsRestrictionNotice(null)}
-            className="text-slate-400 hover:text-white text-xs shrink-0"
-          >
-            Dismiss
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => setIsConfigOpen(true)}
+              className="px-3 py-1 rounded-lg bg-[#D4AF37] text-[#0B0C10] font-bold flex items-center gap-1"
+            >
+              <Key className="w-3 h-3" /> Enter Gemini API Key
+            </button>
+            <button
+              onClick={() => handleRunGeminiLocalization()}
+              className="px-3 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-white font-semibold"
+            >
+              Retry Localization
+            </button>
+            <button
+              onClick={() => setLocalizationErrorBanner(null)}
+              className="text-slate-400 hover:text-white px-1"
+            >
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
 
-      {/* AREA B: TWO-COLUMN DESKTOP MAIN WORKSPACE (LEFT: VIDEO & SUBTITLES, RIGHT: ACTIVE STAGE & DIALOGUE AUDITION) */}
+      {/* Actionable Error Banner for ElevenLabs API Errors */}
+      {elevenLabsErrorBanner && (
+        <div className="bg-amber-500/15 border-b border-amber-500/40 px-5 py-2 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-200 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="truncate">{elevenLabsErrorBanner}</span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => setIsConfigOpen(true)}
+              className="px-3 py-1 rounded-lg bg-amber-400 text-[#0B0C10] font-bold"
+            >
+              Update ElevenLabs Key
+            </button>
+            <button
+              onClick={() => setElevenLabsErrorBanner(null)}
+              className="text-slate-400 hover:text-white px-1"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* AREA B: TWO-COLUMN DESKTOP MAIN WORKSPACE */}
       <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
         {/* LEFT COLUMN: Video Preview Monitor, Subtitle Verification & Audio Source Switcher */}
         <div
@@ -1876,15 +1890,19 @@ export function App() {
                   <FileVideo className="w-8 h-8 text-slate-600 mb-2" />
                   <p className="text-xs text-slate-400 mb-3">
                     {needsVideoReselect
-                      ? 'Project state restored from IndexedDB. Load the sample reel or re-select your source movie file.'
-                      : 'No movie loaded.'}
+                      ? 'Project checkpoint restored from IndexedDB. Please re-select your source movie file to restore video playback.'
+                      : 'Import a movie file (.MP4, .WebM, .MOV, .WAV, .MP3) to start dubbing.'}
                   </p>
-                  <button
-                    onClick={handleLoadVerifiedDemoReel}
-                    className="px-3.5 py-1.5 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-bold"
-                  >
-                    Load Playable Sample Movie
-                  </button>
+                  <label className="px-4 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#e5c247] text-[#0B0C10] text-xs font-bold cursor-pointer flex items-center gap-1.5">
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Import Movie File</span>
+                    <input
+                      type="file"
+                      accept="video/*,audio/*"
+                      onChange={handleFileUpload}
+                      className="hidden"
+                    />
+                  </label>
                 </div>
               )}
 
@@ -1971,7 +1989,7 @@ export function App() {
               )}
             </div>
 
-            {/* Video Transport & Live Audio Track Switcher (Original vs Dubbed Audio) */}
+            {/* Video Transport & Live Audio Track Switcher */}
             <div className="flex flex-wrap items-center justify-between gap-2 bg-[#141824] px-3 py-2 rounded-xl border border-[#222738]">
               <div className="flex items-center gap-1.5">
                 <button
@@ -2115,7 +2133,7 @@ export function App() {
               </div>
             </div>
 
-            {/* P0: Dedicated Active Segment Dialogue Audition Player (Always Accessible Under Video) */}
+            {/* P0: Dedicated Active Segment Dialogue Audition Player */}
             <DialogueAuditionPlayer
               segment={selectedSegment}
               allSegments={segments}
@@ -2138,14 +2156,7 @@ export function App() {
 
           {/* Project Actions Footer */}
           <div className="pt-2 border-t border-[#1E2333] flex items-center justify-between text-[11px] text-slate-400">
-            <div className="flex items-center gap-2">
-              <button
-                onClick={handleLoadVerifiedDemoReel}
-                className="text-[#D4AF37] hover:underline flex items-center gap-1"
-              >
-                <RefreshCw className="w-3 h-3" /> Reload Sample Movie
-              </button>
-              <span>•</span>
+            <div className="flex items-center gap-3">
               <button
                 onClick={() => {
                   const nextSrc = sourceLanguage === 'en' ? 'km' : 'en';
@@ -2158,10 +2169,26 @@ export function App() {
                 }}
                 className="text-slate-300 hover:text-white flex items-center gap-1"
               >
-                <Languages className="w-3 h-3" /> Direction: {sourceLanguage.toUpperCase()} → {targetLanguage.toUpperCase()}
+                <Languages className="w-3 h-3 text-[#D4AF37]" /> Direction: {sourceLanguage.toUpperCase()} → {targetLanguage.toUpperCase()}
               </button>
+              {segments.length > 0 && (
+                <button
+                  onClick={async () => {
+                    await clearCheckpointInIndexedDB();
+                    setSegments([]);
+                    setCharacters([]);
+                    setDisagreements([]);
+                    setRawScribeResponseJson(null);
+                    setFinalValidationReport(null);
+                    appendLog('SYSTEM', 'info', 'Cleared saved project data from browser IndexedDB.');
+                  }}
+                  className="text-rose-400 hover:underline"
+                >
+                  Clear Project
+                </button>
+              )}
             </div>
-            <span>Auto-saved to browser</span>
+            <span>IndexedDB Checkpoint Active</span>
           </div>
         </div>
 
@@ -2172,74 +2199,88 @@ export function App() {
             <div className="flex-1 flex flex-col overflow-hidden">
               <div className="px-6 py-4 border-b border-[#222738] bg-[#11141D] flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-base font-bold text-white">1. Transcribe Movie Dialogue</h2>
+                  <h2 className="text-base font-bold text-white">1. Transcribe Movie Dialogue (ElevenLabs Scribe v2)</h2>
                   <p className="text-xs text-slate-400">{stageProgress.scribe.operation}</p>
                 </div>
                 <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setShowRawScribeModal(true)}
-                    className="px-3 py-1.5 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs text-slate-300 flex items-center gap-1.5"
-                  >
-                    <Eye className="w-3.5 h-3.5" /> Raw Transcript JSON
-                  </button>
+                  {rawScribeResponseJson && (
+                    <button
+                      onClick={() => setShowRawScribeModal(true)}
+                      className="px-3 py-1.5 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs text-slate-300 flex items-center gap-1.5"
+                    >
+                      <Eye className="w-3.5 h-3.5" /> Raw Scribe JSON
+                    </button>
+                  )}
                   <button
                     onClick={() => handleRunLiveScribe2()}
-                    disabled={stageProgress.scribe.status === 'running'}
+                    disabled={stageProgress.scribe.status === 'running' || !sourceFile}
                     className="px-4 py-1.5 rounded-lg bg-[#D4AF37] hover:bg-[#e5c148] text-[#0B0C10] text-xs font-bold flex items-center gap-1.5 disabled:opacity-50"
                   >
                     <Mic2 className="w-3.5 h-3.5" />
-                    {stageProgress.scribe.status === 'running' ? 'Transcribing...' : 'Transcribe Audio'}
+                    {stageProgress.scribe.status === 'running' ? 'Transcribing...' : 'Run Scribe v2 Transcription'}
                   </button>
-                  <button
-                    onClick={() => setActiveStage('STAGE_2_SPEAKERS')}
-                    className="px-3.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold text-white"
-                  >
-                    Next: Verify Speakers →
-                  </button>
+                  {segments.length > 0 && (
+                    <button
+                      onClick={() => setActiveStage('STAGE_2_SPEAKERS')}
+                      className="px-3.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold text-white"
+                    >
+                      Next: Verify Speakers →
+                    </button>
+                  )}
                 </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-6 space-y-3">
-                {segments.map((seg) => {
-                  const isSelected = seg.segment_id === selectedSegment?.segment_id;
-                  const char = characters.find((c) => c.character_id === seg.character_id);
-                  return (
-                    <div
-                      key={seg.segment_id}
-                      onClick={() => {
-                        setSelectedSegmentId(seg.segment_id);
-                        if (videoRef.current) videoRef.current.currentTime = seg.source_start;
-                      }}
-                      className={`p-4 rounded-xl border transition-all cursor-pointer ${
-                        isSelected
-                          ? 'bg-[#161B29] border-[#D4AF37]'
-                          : 'bg-[#11141D] border-[#1F2433] hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 mb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-mono font-semibold text-[#D4AF37]">
-                            {seg.segment_id}
-                          </span>
-                          <span className="text-xs text-slate-300 font-medium">
-                            {char?.character_name || seg.speaker_id}
+                {segments.length === 0 ? (
+                  <div className="p-10 rounded-xl bg-[#11141D] border border-[#222738] text-center space-y-3">
+                    <Mic2 className="w-8 h-8 text-[#D4AF37] mx-auto" />
+                    <div className="text-sm font-bold text-white">No Transcript Loaded Yet</div>
+                    <p className="text-xs text-slate-400 max-w-md mx-auto">
+                      Import your movie file using the top bar, configure your ElevenLabs API key in Settings, and click &ldquo;Run Scribe v2 Transcription&rdquo; to extract word-level timestamps and speaker diarization.
+                    </p>
+                  </div>
+                ) : (
+                  segments.map((seg) => {
+                    const isSelected = seg.segment_id === selectedSegment?.segment_id;
+                    const char = characters.find((c) => c.character_id === seg.character_id);
+                    return (
+                      <div
+                        key={seg.segment_id}
+                        onClick={() => {
+                          setSelectedSegmentId(seg.segment_id);
+                          if (videoRef.current) videoRef.current.currentTime = seg.source_start;
+                        }}
+                        className={`p-4 rounded-xl border transition-all cursor-pointer ${
+                          isSelected
+                            ? 'bg-[#161B29] border-[#D4AF37]'
+                            : 'bg-[#11141D] border-[#1F2433] hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-mono font-semibold text-[#D4AF37]">
+                              {seg.segment_id}
+                            </span>
+                            <span className="text-xs text-slate-300 font-medium">
+                              {char?.character_name || seg.speaker_id}
+                            </span>
+                          </div>
+                          <span className="text-xs font-mono text-slate-400">
+                            {seg.source_start.toFixed(2)}s – {seg.source_end.toFixed(2)}s ({seg.available_duration.toFixed(2)}s)
                           </span>
                         </div>
-                        <span className="text-xs font-mono text-slate-400">
-                          {seg.source_start.toFixed(2)}s – {seg.source_end.toFixed(2)}s ({seg.available_duration.toFixed(2)}s)
-                        </span>
+                        <input
+                          type="text"
+                          value={seg.original_text}
+                          onChange={(e) =>
+                            handleInlineEditSegmentText(seg.segment_id, 'original_text', e.target.value)
+                          }
+                          className="w-full bg-[#0B0C10] border border-[#262B3D] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#D4AF37]"
+                        />
                       </div>
-                      <input
-                        type="text"
-                        value={seg.original_text}
-                        onChange={(e) =>
-                          handleInlineEditSegmentText(seg.segment_id, 'original_text', e.target.value)
-                        }
-                        className="w-full bg-[#0B0C10] border border-[#262B3D] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#D4AF37]"
-                      />
-                    </div>
-                  );
-                })}
+                    );
+                  })
+                )}
               </div>
             </div>
           )}
@@ -2249,12 +2290,29 @@ export function App() {
             <div className="flex-1 flex flex-col overflow-hidden">
               <div className="px-6 py-4 border-b border-[#222738] bg-[#11141D] flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-base font-bold text-white">2. Verify Speakers & Assign Character Voices</h2>
+                  <h2 className="text-base font-bold text-white">2. Verify Speakers & Assign ElevenLabs Voices</h2>
                   <p className="text-xs text-slate-400">
-                    Assign a consistent voice to each speaker and resolve any transcript verification flags.
+                    Sync your ElevenLabs voices, assign a voice to each speaker, and lock it for consistent dubbing.
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      if (!credentials.elevenLabsApiKey.trim()) {
+                        setIsConfigOpen(true);
+                        return;
+                      }
+                      fetchElevenLabsVoices(credentials.elevenLabsApiKey)
+                        .then((voices) => {
+                          setAvailableVoices(voices);
+                          appendLog('VOICE_VAULT', 'success', `Synced ${voices.length} voices from ElevenLabs.`);
+                        })
+                        .catch((err) => appendLog('VOICE_VAULT', 'error', err.message));
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs text-slate-200 flex items-center gap-1.5"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-[#D4AF37]" /> Sync ElevenLabs Voices
+                  </button>
                   <button
                     onClick={handleRunWhisperVerification}
                     className="px-3 py-1.5 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs text-sky-300 flex items-center gap-1.5"
@@ -2271,966 +2329,71 @@ export function App() {
               </div>
 
               <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                {/* Speaker Cards */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {characters.map((char) => (
-                    <div
-                      key={char.character_id}
-                      className="p-4 rounded-xl bg-[#11141D] border border-[#222738] space-y-3"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <input
-                            type="text"
-                            value={char.character_name}
-                            onChange={(e) => {
-                              const name = e.target.value;
-                              setCharacters((prev) =>
-                                prev.map((c) =>
-                                  c.character_id === char.character_id ? { ...c, character_name: name } : c
-                                )
-                              );
-                            }}
-                            className="bg-transparent text-sm font-bold text-white border-b border-transparent focus:border-[#D4AF37] focus:outline-none"
-                          />
-                          <div className="text-[11px] text-slate-400">
-                            {char.original_speaker_id} • {char.dialogue_count} dialogue lines
-                          </div>
-                        </div>
-
-                        <button
-                          onClick={() =>
-                            setCharacters((prev) =>
-                              prev.map((c) =>
-                                c.character_id === char.character_id
-                                  ? { ...c, is_voice_locked: !c.is_voice_locked }
-                                  : c
-                              )
-                            )
-                          }
-                          className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 ${
-                            char.is_voice_locked
-                              ? 'bg-[#D4AF37]/20 text-[#D4AF37] border border-[#D4AF37]/40'
-                              : 'bg-slate-800 text-slate-400'
-                          }`}
-                        >
-                          {char.is_voice_locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
-                          <span>{char.is_voice_locked ? 'Voice Locked' : 'Unlocked'}</span>
-                        </button>
-                      </div>
-
-                      <div>
-                        <label className="block text-[11px] text-slate-400 mb-1">
-                          Assigned Voice {char.is_voice_locked && '(Unlock to change)'}
-                        </label>
-                        <select
-                          disabled={char.is_voice_locked}
-                          value={char.assigned_voice_id}
-                          onChange={(e) => {
-                            const vId = e.target.value;
-                            const vObj = availableVoices.find((v) => v.voice_id === vId);
-                            setCharacters((prev) =>
-                              prev.map((c) =>
-                                c.character_id === char.character_id
-                                  ? {
-                                      ...c,
-                                      assigned_voice_id: vId,
-                                      assigned_voice_name: vObj?.name || vId
-                                    }
-                                  : c
-                              )
-                            );
-                          }}
-                          className="w-full px-3 py-2 rounded-lg bg-[#0B0C10] border border-[#2C3347] text-xs text-white disabled:opacity-60"
-                        >
-                          {availableVoices.map((v) => (
-                            <option key={v.voice_id} value={v.voice_id}>
-                              {v.name}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-
-                      <div className="flex items-center justify-between pt-2 border-t border-[#1E2333]">
-                        {characters.length > 1 ? (
-                          <select
-                            defaultValue=""
-                            onChange={(e) => {
-                              if (e.target.value) {
-                                handleMergeSpeakerIntoCharacter(char.character_id, e.target.value);
-                              }
-                            }}
-                            className="bg-[#0B0C10] border border-[#2C3347] rounded px-2 py-1 text-xs text-slate-300"
-                          >
-                            <option value="" disabled>
-                              Merge into speaker...
-                            </option>
-                            {characters
-                              .filter((other) => other.character_id !== char.character_id)
-                              .map((other) => (
-                                <option key={other.character_id} value={other.character_id}>
-                                  {other.character_name}
-                                </option>
-                              ))}
-                          </select>
-                        ) : (
-                          <span />
-                        )}
-
-                        <button
-                          onClick={() => handleAuditionCharacterVoice(char.character_id)}
-                          className="px-3 py-1 rounded-lg bg-[#D4AF37]/15 hover:bg-[#D4AF37]/25 border border-[#D4AF37]/40 text-xs font-semibold text-[#D4AF37] flex items-center gap-1.5"
-                        >
-                          <Volume2 className="w-3.5 h-3.5" /> Audition Khmer Sample
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Transcript Verification Diffs (if any) */}
-                {disagreements.length > 0 && (
-                  <div className="space-y-3 pt-4 border-t border-[#222738]">
-                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                      Transcript Verification Items ({disagreements.filter((d) => !d.resolved).length} Pending)
-                    </h3>
-                    {disagreements.map((dis) => (
-                      <div
-                        key={dis.id}
-                        className="p-3.5 rounded-xl bg-[#11141D] border border-[#222738] flex flex-wrap items-center justify-between gap-3"
-                      >
-                        <div className="text-xs space-y-1">
-                          <span className="font-mono text-amber-300">
-                            {dis.segment_id} [{dis.timestamp_start.toFixed(1)}s–{dis.timestamp_end.toFixed(1)}s]
-                          </span>
-                          <div className="text-slate-300">Scribe: &ldquo;{dis.scribe_text}&rdquo;</div>
-                          <div className="text-slate-400">Whisper: &ldquo;{dis.whisper_text}&rdquo;</div>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => handleResolveDisagreement(dis.id, 'scribe')}
-                            className="px-3 py-1 rounded bg-sky-500/20 text-sky-200 text-xs font-medium"
-                          >
-                            Keep Scribe
-                          </button>
-                          <button
-                            onClick={() => handleResolveDisagreement(dis.id, 'whisper')}
-                            className="px-3 py-1 rounded bg-purple-500/20 text-purple-200 text-xs font-medium"
-                          >
-                            Use Whisper Text
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                {characters.length === 0 ? (
+                  <div className="p-8 rounded-xl bg-[#11141D] border border-[#222738] text-center text-xs text-slate-400">
+                    Transcribe a movie in Stage 1 first to populate diarized speaker profiles.
                   </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* STAGE 3 & STAGE 4: UNIFIED INTUITIVE KHMER DIALOGUE & VOICE AUDITION WORKSPACE */}
-          {(activeStage === 'STAGE_3_LOCALIZE_KHMER' || activeStage === 'STAGE_4_VOICES_AUDITION') && (
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="px-6 py-4 border-b border-[#222738] bg-[#11141D] flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-base font-bold text-white">
-                    {activeStage === 'STAGE_3_LOCALIZE_KHMER'
-                      ? '3. Localize Dialogue into Natural Spoken Cambodian Khmer'
-                      : '4. Generate & Audition Khmer Character Voices'}
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    {activeStage === 'STAGE_3_LOCALIZE_KHMER'
-                      ? stageProgress.gemini.operation
-                      : stageProgress.synthesis.operation}
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <select
-                    value={dialogueStyle}
-                    onChange={(e) => setDialogueStyle(e.target.value as DialogueStyle)}
-                    className="px-3 py-1.5 rounded-lg bg-[#0B0C10] border border-[#2C3347] text-xs text-white"
-                  >
-                    {Object.values(DialogueStyle).map((st) => (
-                      <option key={st} value={st}>
-                        {st}
-                      </option>
-                    ))}
-                  </select>
-
-                  <button
-                    onClick={() => handleRunGeminiLocalization()}
-                    disabled={stageProgress.gemini.status === 'running'}
-                    className="px-3.5 py-1.5 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
-                  >
-                    <Wand2 className="w-3.5 h-3.5 text-[#D4AF37]" />
-                    <span>
-                      {stageProgress.gemini.status === 'running' ? 'Translating...' : 'Translate All with Gemini'}
-                    </span>
-                  </button>
-
-                  <button
-                    onClick={() => handleSynthesizeAllUnapprovedSegments()}
-                    disabled={stageProgress.synthesis.status === 'running'}
-                    className="px-4 py-1.5 rounded-lg bg-[#D4AF37] hover:bg-[#e5c148] text-[#0B0C10] text-xs font-bold flex items-center gap-1.5 shadow disabled:opacity-50"
-                  >
-                    <Volume2 className="w-3.5 h-3.5" />
-                    <span>
-                      {stageProgress.synthesis.status === 'running'
-                        ? 'Generating Audio...'
-                        : 'Generate All Audio Clips'}
-                    </span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Coherent Editable Dialogue Cards List */}
-              <div className="flex-1 overflow-y-auto p-6 space-y-4">
-                {segments.map((seg) => {
-                  const isSelected = seg.segment_id === selectedSegment?.segment_id;
-                  const char = characters.find((c) => c.character_id === seg.character_id);
-                  const hasAudio = Boolean(seg.synthesized_audio_base64);
-                  const isOutdated = Boolean(seg.needs_resynthesis && hasAudio);
-                  const isThisSynthesizing = synthesizingSegmentId === seg.segment_id;
-                  const effectiveDur =
-                    seg.actual_synthesized_duration !== null
-                      ? Number((seg.actual_synthesized_duration / (seg.playback_rate_adjustment || 1.0)).toFixed(2))
-                      : null;
-
-                  return (
-                    <div
-                      key={seg.segment_id}
-                      onClick={() => setSelectedSegmentId(seg.segment_id)}
-                      className={`p-4 rounded-xl border transition-all cursor-pointer space-y-3 ${
-                        isSelected
-                          ? 'bg-[#161B29] border-[#D4AF37] shadow-md'
-                          : 'bg-[#11141D] border-[#1F2433] hover:border-slate-700'
-                      }`}
-                    >
-                      {/* Card Top Row: Segment, Speaker Dropdown, Assigned Voice, Status Badges */}
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-white/10 text-white">
-                            {seg.segment_id}
-                          </span>
-
-                          <select
-                            value={seg.character_id}
-                            onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => handleReassignSpeaker(seg.segment_id, e.target.value)}
-                            className="bg-[#0B0C10] border border-[#2C3347] rounded-lg px-2.5 py-1 text-xs text-[#D4AF37] font-semibold"
-                          >
-                            {characters.map((c) => (
-                              <option key={c.character_id} value={c.character_id}>
-                                {c.character_name} — {c.assigned_voice_name}
-                              </option>
-                            ))}
-                          </select>
-
-                          <span className="text-xs font-mono text-slate-400">
-                            {seg.source_start.toFixed(1)}s–{seg.source_end.toFixed(1)}s ({seg.available_duration.toFixed(2)}s window)
-                          </span>
-                        </div>
-
-                        <div className="flex items-center gap-2">
-                          {/* Audio Status Badge */}
-                          {isOutdated ? (
-                            <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                              Outdated Audio — Regenerate
-                            </span>
-                          ) : hasAudio ? (
-                            <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                              Audio Ready ({effectiveDur}s)
-                            </span>
-                          ) : (
-                            <span className="px-2 py-0.5 rounded text-[11px] bg-slate-800 text-slate-400">
-                              No Audio Yet
-                            </span>
-                          )}
-
-                          {/* Timing Status Badge */}
-                          {hasAudio && (
-                            <span
-                              className={`px-2 py-0.5 rounded text-[11px] font-mono ${
-                                seg.timing_status === TimingStatus.OVERFLOW_FAILED
-                                  ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                                  : seg.timing_status === TimingStatus.WARNING
-                                    ? 'bg-amber-500/20 text-amber-300'
-                                    : 'bg-emerald-500/15 text-emerald-300'
-                              }`}
-                            >
-                              {seg.timing_status === TimingStatus.OVERFLOW_FAILED
-                                ? `+${seg.overlap_seconds.toFixed(2)}s Overflow`
-                                : seg.timing_status === TimingStatus.WARNING
-                                  ? 'Tight Fit'
-                                  : 'Fits Window'}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Source English Line */}
-                      <div className="text-xs text-slate-300 bg-[#0B0C10] px-3 py-2 rounded-lg border border-[#1E2333] flex items-center justify-between gap-2">
-                        <span>{seg.original_text}</span>
-                        {seg.literal_meaning && (
-                          <span className="text-[11px] text-slate-500 italic shrink-0">
-                            Literal: {seg.literal_meaning}
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Editable Khmer Translation + Natural vs Shorter Switch + Immediate Audition Buttons */}
-                      <div className="space-y-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                commitSegmentsUpdate((prev) =>
-                                  prev.map((s) =>
-                                    s.segment_id === seg.segment_id
-                                      ? {
-                                          ...s,
-                                          selected_version_type: 'natural',
-                                          active_target_text: s.natural_spoken_version,
-                                          needs_resynthesis: Boolean(s.synthesized_audio_base64)
-                                        }
-                                      : s
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {characters.map((char) => (
+                      <div
+                        key={char.character_id}
+                        className="p-4 rounded-xl bg-[#11141D] border border-[#222738] space-y-3"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <input
+                              type="text"
+                              value={char.character_name}
+                              onChange={(e) => {
+                                const name = e.target.value;
+                                setCharacters((prev) =>
+                                  prev.map((c) =>
+                                    c.character_id === char.character_id ? { ...c, character_name: name } : c
                                   )
                                 );
                               }}
-                              className={`px-2.5 py-1 rounded text-[11px] font-medium border ${
-                                seg.selected_version_type === 'natural'
-                                  ? 'bg-[#D4AF37]/20 border-[#D4AF37] text-[#D4AF37]'
-                                  : 'bg-[#0B0C10] border-[#262B3D] text-slate-400'
-                              }`}
-                            >
-                              Natural Spoken Khmer
-                            </button>
-                            {seg.shorter_dubbing_version && (
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  commitSegmentsUpdate((prev) =>
-                                    prev.map((s) =>
-                                      s.segment_id === seg.segment_id
-                                        ? {
-                                            ...s,
-                                            selected_version_type: 'shorter',
-                                            active_target_text: s.shorter_dubbing_version,
-                                            needs_resynthesis: Boolean(s.synthesized_audio_base64)
-                                          }
-                                        : s
-                                    )
-                                  );
-                                }}
-                                className={`px-2.5 py-1 rounded text-[11px] font-medium border ${
-                                  seg.selected_version_type === 'shorter'
-                                    ? 'bg-sky-500/20 border-sky-400 text-sky-300'
-                                    : 'bg-[#0B0C10] border-[#262B3D] text-slate-400'
-                                }`}
-                              >
-                                Shorter Version (Fits Tight Window)
-                              </button>
-                            )}
+                              className="bg-transparent text-sm font-bold text-white border-b border-transparent focus:border-[#D4AF37] focus:outline-none"
+                            />
+                            <div className="text-[11px] text-slate-400">
+                              {char.original_speaker_id} • {char.dialogue_count} dialogue lines
+                            </div>
                           </div>
 
-                          {/* Per-Segment Action Buttons: Play Original, Generate/Regenerate, Audition Khmer */}
-                          <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              onClick={() => handlePlayOriginalWindow(seg)}
-                              className="px-2.5 py-1 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs text-sky-300 flex items-center gap-1"
-                            >
-                              <Play className="w-3 h-3" /> Original
-                            </button>
-
-                            <button
-                              onClick={() => handleSynthesizeSingleSegment(seg.segment_id)}
-                              disabled={isThisSynthesizing}
-                              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${
-                                !hasAudio || isOutdated
-                                  ? 'bg-[#D4AF37] text-[#0B0C10] hover:bg-[#e5c247]'
-                                  : 'bg-[#181C28] hover:bg-[#222738] text-slate-200 border border-[#2C3347]'
-                              }`}
-                            >
-                              <RefreshCw className={`w-3 h-3 ${isThisSynthesizing ? 'animate-spin' : ''}`} />
-                              <span>
-                                {isThisSynthesizing
-                                  ? 'Generating...'
-                                  : !hasAudio
-                                    ? 'Generate Audio'
-                                    : 'Regenerate Audio'}
-                              </span>
-                            </button>
-
-                            {hasAudio && !isOutdated && (
-                              <button
-                                onClick={() => {
-                                  setSelectedSegmentId(seg.segment_id);
-                                  playBase64Audio(
-                                    seg.synthesized_audio_base64!,
-                                    seg.synthesized_audio_mime,
-                                    seg.playback_rate_adjustment || 1.0
-                                  );
-                                }}
-                                className="px-3 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs font-semibold text-emerald-200 flex items-center gap-1"
-                              >
-                                <Volume2 className="w-3.5 h-3.5" /> Audition Khmer
-                              </button>
-                            )}
-                          </div>
-                        </div>
-
-                        <textarea
-                          rows={2}
-                          value={seg.active_target_text}
-                          onClick={(e) => e.stopPropagation()}
-                          onChange={(e) =>
-                            handleInlineEditSegmentText(
-                              seg.segment_id,
-                              'active_target_text',
-                              e.target.value
-                            )
-                          }
-                          placeholder="Khmer translation..."
-                          className="w-full p-2.5 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-base text-white font-['Kantumruy_Pro',sans-serif] leading-relaxed focus:outline-none focus:border-[#D4AF37]"
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* STAGE 5: SYNCHRONIZE TIMING & SUBTITLES */}
-          {activeStage === 'STAGE_5_SYNCHRONIZE' && (
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="px-6 py-4 border-b border-[#222738] bg-[#11141D] flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-base font-bold text-white">
-                    5. Synchronize Audio Timing & Verify Lip-Sync Alignment
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Resolve duration overflows before assembly and open the multitrack timeline for fine adjustments.
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  {overflowSegsCount > 0 && (
-                    <button
-                      onClick={handleAutoFitAllOverflows}
-                      className="px-3.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 text-xs font-semibold"
-                    >
-                      Auto-Fit {overflowSegsCount} Overflows (Concise + 1.10x)
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setShowTimeline(!showTimeline)}
-                    className="px-3.5 py-1.5 rounded-lg bg-[#181C28] hover:bg-[#222738] border border-[#2C3347] text-xs font-medium text-slate-200"
-                  >
-                    {showTimeline ? 'Hide Multitrack Timeline' : 'Open Multitrack Timeline'}
-                  </button>
-                  <button
-                    onClick={() => setActiveStage('STAGE_6_ASSEMBLE_EXPORT')}
-                    className="px-4 py-1.5 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-bold"
-                  >
-                    Next: Assemble & Export →
-                  </button>
-                </div>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-6 space-y-3">
-                {segments.map((seg) => {
-                  const effectiveDur =
-                    seg.actual_synthesized_duration !== null
-                      ? Number((seg.actual_synthesized_duration / (seg.playback_rate_adjustment || 1.0)).toFixed(2))
-                      : null;
-
-                  return (
-                    <div
-                      key={seg.segment_id}
-                      onClick={() => setSelectedSegmentId(seg.segment_id)}
-                      className={`p-4 rounded-xl border flex flex-wrap items-center justify-between gap-4 cursor-pointer ${
-                        seg.timing_status === TimingStatus.OVERFLOW_FAILED
-                          ? 'bg-rose-950/15 border-rose-500/40'
-                          : 'bg-[#11141D] border-[#222738]'
-                      }`}
-                    >
-                      <div className="space-y-1 max-w-xl">
-                        <div className="flex items-center gap-2 text-xs font-mono">
-                          <span className="text-[#D4AF37] font-bold">{seg.segment_id}</span>
-                          <span className="text-slate-400">
-                            Source Window: {seg.available_duration.toFixed(2)}s
-                          </span>
-                          <span>→</span>
-                          <span className="text-white">
-                            Dubbed Duration: {effectiveDur !== null ? `${effectiveDur}s` : 'Unmeasured'}
-                          </span>
-                        </div>
-                        <div className="text-sm text-white font-['Kantumruy_Pro',sans-serif]">
-                          {seg.active_target_text || seg.original_text}
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-3" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex items-center gap-1.5 bg-[#0B0C10] px-2.5 py-1 rounded-lg border border-[#262B3D]">
-                          <span className="text-xs text-slate-400">Speed:</span>
-                          <select
-                            value={seg.playback_rate_adjustment}
-                            onChange={(e) => {
-                              const rate = Number(e.target.value);
-                              commitSegmentsUpdate((prev) => {
-                                const updated = prev.map((s) =>
-                                  s.segment_id === seg.segment_id
-                                    ? { ...s, playback_rate_adjustment: rate }
-                                    : s
-                                );
-                                return evaluateTimelineDurationAlignment(updated).updatedSegments;
-                              });
-                            }}
-                            className="bg-transparent text-xs font-mono text-white focus:outline-none"
-                          >
-                            <option value={1.0}>1.00x (Natural)</option>
-                            <option value={1.05}>1.05x</option>
-                            <option value={1.1}>1.10x</option>
-                            <option value={1.15}>1.15x</option>
-                          </select>
-                        </div>
-
-                        <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={Boolean(seg.lip_sync_manual_verified)}
-                            onChange={(e) => {
-                              const checked = e.target.checked;
-                              commitSegmentsUpdate((prev) =>
-                                prev.map((s) =>
-                                  s.segment_id === seg.segment_id
-                                    ? { ...s, lip_sync_manual_verified: checked }
-                                    : s
+                          <button
+                            onClick={() =>
+                              setCharacters((prev) =>
+                                prev.map((c) =>
+                                  c.character_id === char.character_id
+                                    ? { ...c, is_voice_locked: !c.is_voice_locked }
+                                    : c
                                 )
-                              );
-                            }}
-                            className="rounded border-slate-600 bg-[#0B0C10] text-emerald-400"
-                          />
-                          <span>Visual Sync Reviewed</span>
-                        </label>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
+                              )
+                            }
+                            className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 ${
+                              char.is_voice_locked
+                                ? 'bg-[#D4AF37]/20 text-[#D4AF37] border border-[#D4AF37]/40'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {char.is_voice_locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                            <span>{char.is_voice_locked ? 'Voice Locked' : 'Unlocked'}</span>
+                          </button>
+                        </div>
 
-          {/* STAGE 6: ASSEMBLE & EXPORT WITH PRE-FLIGHT READINESS GATE */}
-          {activeStage === 'STAGE_6_ASSEMBLE_EXPORT' && (
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {/* Pre-Flight Readiness Check Banner (Prevents Assembly Blocker) */}
-              <div
-                className={`p-5 rounded-xl border ${
-                  validAudioClipsCount > 0 && outdatedAudioClipsCount === 0
-                    ? 'bg-emerald-500/10 border-emerald-500/30'
-                    : 'bg-amber-500/10 border-amber-500/40'
-                }`}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <div className="text-sm font-bold text-white flex items-center gap-2">
-                      {validAudioClipsCount > 0 && outdatedAudioClipsCount === 0 ? (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      ) : (
-                        <AlertTriangle className="w-4 h-4 text-amber-400" />
-                      )}
-                      <span>
-                        Pre-Flight Assembly Readiness: {validAudioClipsCount} of {totalSegs} Valid Dubbed Audio Clips Ready
-                      </span>
-                    </div>
-                    <p className="text-xs text-slate-300">
-                      {validAudioClipsCount === 0
-                        ? 'Final movie assembly requires synthesized dialogue audio. Click "Generate All Missing Audio Clips" below before assembling.'
-                        : outdatedAudioClipsCount > 0
-                          ? `${outdatedAudioClipsCount} segment(s) have edited Khmer text with outdated audio. Regenerate them so your export includes your latest edits.`
-                          : 'All synthesized audio assets and timing anchors are verified and ready for final muxing.'}
-                    </p>
-                  </div>
-
-                  {(validAudioClipsCount < totalSegs || outdatedAudioClipsCount > 0) && (
-                    <button
-                      onClick={() => handleSynthesizeAllUnapprovedSegments()}
-                      disabled={stageProgress.synthesis.status === 'running'}
-                      className="px-4 py-2 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-bold flex items-center gap-1.5 shadow"
-                    >
-                      <Volume2 className="w-3.5 h-3.5" />
-                      <span>
-                        {stageProgress.synthesis.status === 'running'
-                          ? 'Generating Audio Clips...'
-                          : 'Generate Missing / Outdated Audio Clips Now'}
-                      </span>
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {/* Export & Mixing Settings */}
-                <div className="p-5 rounded-xl bg-[#11141D] border border-[#222738] space-y-4">
-                  <h3 className="text-sm font-bold text-white">Audio Mixing & Subtitle Export Options</h3>
-
-                  <div className="space-y-1.5">
-                    <label className="block text-xs text-slate-300">Soundtrack Mixing Mode</label>
-                    <select
-                      value={audioMixMode}
-                      onChange={(e) => setAudioMixMode(e.target.value as AudioMixMode)}
-                      className="w-full px-3 py-2 rounded-lg bg-[#0B0C10] border border-[#2C3347] text-xs text-white"
-                    >
-                      <option value={AudioMixMode.DUCK_ORIGINAL}>
-                        Auto-Duck Original Soundtrack Under Khmer Dialogue
-                      </option>
-                      <option value={AudioMixMode.REPLACE_ORIGINAL}>
-                        Replace Original Audio Completely with Khmer Dialogue
-                      </option>
-                      <option value={AudioMixMode.DIALOGUE_ONLY}>
-                        Export Dubbed Khmer Dialogue Stem Only (.WAV)
-                      </option>
-                    </select>
-                  </div>
-
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs text-slate-200">
-                    <input
-                      type="checkbox"
-                      checked={subtitleConfig.burnInSubtitlesOnExport}
-                      onChange={(e) =>
-                        setSubtitleConfig({
-                          ...subtitleConfig,
-                          burnInSubtitlesOnExport: e.target.checked
-                        })
-                      }
-                      className="rounded border-slate-600 bg-[#0B0C10] text-[#D4AF37]"
-                    />
-                    <span>Burn-in subtitles on exported video (plus downloadable .SRT and .VTT files)</span>
-                  </label>
-
-                  <div className="pt-3 border-t border-[#1E2333]">
-                    <button
-                      onClick={() => handleRunFinalAssembly()}
-                      disabled={
-                        stageProgress.assembly.status === 'running' || validAudioClipsCount === 0
-                      }
-                      className="w-full py-2.5 rounded-xl bg-[#D4AF37] hover:bg-[#e3be42] text-[#0B0C10] font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg disabled:opacity-40"
-                    >
-                      <Film className="w-4 h-4" />
-                      <span>
-                        {stageProgress.assembly.status === 'running'
-                          ? stageProgress.assembly.operation
-                          : validAudioClipsCount === 0
-                            ? 'Generate Audio Clips First to Enable Assembly'
-                            : 'Assemble & Validate Final Dubbed Movie'}
-                      </span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Lip-Sync Mode Disclosure */}
-                <div className="p-5 rounded-xl bg-[#11141D] border border-[#222738] space-y-3">
-                  <h3 className="text-sm font-bold text-white">Synchronization & Lip-Sync Mode</h3>
-                  <div className="p-3.5 rounded-lg bg-[#0B0C10] border border-[#222738] space-y-1">
-                    <div className="text-xs font-semibold text-emerald-300">
-                      Mode A: Timing-Aligned Dubbing (Active)
-                    </div>
-                    <p className="text-xs text-slate-400 leading-relaxed">
-                      Places duration-measured Khmer speech accurately within Scribe&apos;s speaking windows. Visual mouth movements in the original video are not modified unless an external Mode B lip-sync worker is connected in Settings.
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Completed Export & Playback Card */}
-              {finalValidationReport && (
-                <div className="p-6 rounded-xl bg-[#111622] border border-emerald-500/40 space-y-4">
-                  <div className="flex flex-wrap items-center justify-between gap-4">
-                    <div>
-                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 mb-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Final Movie Validated
-                      </span>
-                      <h3 className="text-base font-bold text-white">
-                        Dubbed Movie Master Ready for Download
-                      </h3>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      {finalValidationReport.srtDownloadUrl && (
-                        <a
-                          href={finalValidationReport.srtDownloadUrl}
-                          download={`${projectName.replace(/\s+/g, '_')}.srt`}
-                          className="px-3 py-2 rounded-lg bg-[#1A1E2B] hover:bg-[#252B3F] border border-[#2E364F] text-xs font-semibold text-sky-300 flex items-center gap-1.5"
-                        >
-                          <Download className="w-3.5 h-3.5" /> .SRT
-                        </a>
-                      )}
-                      {finalValidationReport.vttDownloadUrl && (
-                        <a
-                          href={finalValidationReport.vttDownloadUrl}
-                          download={`${projectName.replace(/\s+/g, '_')}.vtt`}
-                          className="px-3 py-2 rounded-lg bg-[#1A1E2B] hover:bg-[#252B3F] border border-[#2E364F] text-xs font-semibold text-purple-300 flex items-center gap-1.5"
-                        >
-                          <Download className="w-3.5 h-3.5" /> .VTT
-                        </a>
-                      )}
-                      <a
-                        href={finalValidationReport.downloadUrl}
-                        download={
-                          finalValidationReport.mimeType.includes('wav')
-                            ? `${projectName.replace(/\s+/g, '_')}_khmer_dialogue.wav`
-                            : `${projectName.replace(/\s+/g, '_')}_dubbed_master.webm`
-                        }
-                        className="px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#0B0C10] font-bold text-xs flex items-center gap-2 shadow-lg"
-                      >
-                        <Download className="w-4 h-4" />
-                        Download Dubbed Movie ({(finalValidationReport.fileSizeBytes / 1024).toFixed(0)} KB)
-                      </a>
-                    </div>
-                  </div>
-
-                  {!finalValidationReport.mimeType.includes('wav') && (
-                    <video
-                      src={finalValidationReport.downloadUrl}
-                      controls
-                      className="w-full max-w-2xl rounded-xl border border-[#262B3D] bg-black"
-                    />
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* AUDIT & QA REPORT WORKSPACE */}
-          {activeStage === 'STUDIO_AUDIT_QA' && (
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              <div className="p-5 rounded-xl bg-[#11141D] border border-[#222738] space-y-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h2 className="text-base font-bold text-white">
-                      Production Quality Assurance & Blocking Diagnostics Report
-                    </h2>
-                    <p className="text-xs text-slate-400">
-                      Distinguishes blocking export errors from non-blocking review warnings.
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => {
-                      const res = runStudioVerificationSuite(segments, characters);
-                      setVerificationTests(res);
-                    }}
-                    className="px-3.5 py-1.5 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-bold"
-                  >
-                    Run Acceptance Suite
-                  </button>
-                </div>
-
-                {/* QA Checklist Grid */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
-                  <div className="p-3.5 rounded-lg bg-[#0B0C10] border border-[#1E2333]">
-                    <div className="text-slate-400">Synthesized Audio Clips</div>
-                    <div className="text-base font-bold text-white mt-1">
-                      {validAudioClipsCount} / {totalSegs} Ready
-                    </div>
-                    {validAudioClipsCount === 0 && (
-                      <button
-                        onClick={() => setActiveStage('STAGE_4_VOICES_AUDITION')}
-                        className="text-rose-400 hover:underline mt-1 block font-medium"
-                      >
-                        Blocking: Go to Stage 4 →
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="p-3.5 rounded-lg bg-[#0B0C10] border border-[#1E2333]">
-                    <div className="text-slate-400">Outdated Audio Clips</div>
-                    <div className="text-base font-bold text-white mt-1">
-                      {outdatedAudioClipsCount} Stale
-                    </div>
-                    {outdatedAudioClipsCount > 0 && (
-                      <button
-                        onClick={() => setActiveStage('STAGE_4_VOICES_AUDITION')}
-                        className="text-amber-300 hover:underline mt-1 block font-medium"
-                      >
-                        Regenerate edited lines →
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="p-3.5 rounded-lg bg-[#0B0C10] border border-[#1E2333]">
-                    <div className="text-slate-400">Khmer Localization</div>
-                    <div className="text-base font-bold text-white mt-1">
-                      {localizedSegsCount} / {totalSegs} Translated
-                    </div>
-                  </div>
-
-                  <div className="p-3.5 rounded-lg bg-[#0B0C10] border border-[#1E2333]">
-                    <div className="text-slate-400">Timing Overflows</div>
-                    <div className="text-base font-bold text-white mt-1">
-                      {overflowSegsCount} Overflows
-                    </div>
-                    {overflowSegsCount > 0 && (
-                      <button
-                        onClick={() => setActiveStage('STAGE_5_SYNCHRONIZE')}
-                        className="text-amber-300 hover:underline mt-1 block font-medium"
-                      >
-                        Review in Stage 5 →
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Automated Verification Tests */}
-              <div className="space-y-2.5">
-                {verificationTests.map((t) => (
-                  <div
-                    key={t.id}
-                    className={`p-4 rounded-xl border flex items-center justify-between ${
-                      t.passed
-                        ? 'bg-[#111622] border-emerald-500/35'
-                        : 'bg-rose-950/20 border-rose-500/40'
-                    }`}
-                  >
-                    <div>
-                      <div className="text-sm font-bold text-white">{t.name}</div>
-                      <p className="text-xs text-slate-400 mt-0.5">{t.details}</p>
-                    </div>
-                    <span
-                      className={`px-2.5 py-1 rounded text-xs font-mono font-bold ${
-                        t.passed ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'
-                      }`}
-                    >
-                      {t.passed ? 'PASSED' : 'FAILED'}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* AREA D: COLLAPSIBLE MULTITRACK TIMELINE EDITOR */}
-      {showTimeline && (
-        <MultiTrackTimeline
-          segments={segments}
-          characters={characters}
-          durationSec={videoDurationSec}
-          currentTimeSec={currentTimeSec}
-          selectedSegmentId={selectedSegment?.segment_id || null}
-          selectedSegmentIds={selectedSegmentIds}
-          canUndo={undoStack.length > 0}
-          canRedo={redoStack.length > 0}
-          hasUnsavedTimelineEdits={hasUnsavedTimelineEdits}
-          onSelectSegment={(id, multi) => {
-            setSelectedSegmentId(id);
-            if (multi) {
-              setSelectedSegmentIds((prev) =>
-                prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-              );
-            } else {
-              setSelectedSegmentIds([id]);
-            }
-          }}
-          onSeek={(time) => {
-            setCurrentTimeSec(time);
-            if (videoRef.current) {
-              videoRef.current.currentTime = time;
-            }
-          }}
-          onUpdateSegmentTiming={handleUpdateSegmentTiming}
-          onSplitSegmentAtPlayhead={handleSplitSegmentAtPlayhead}
-          onMergeSelectedSegments={handleMergeSelectedSegments}
-          onReassignSpeaker={handleReassignSpeaker}
-          onInlineEditSegmentText={handleInlineEditSegmentText}
-          onToggleSourceLock={handleToggleSourceLock}
-          onUndo={handleUndo}
-          onRedo={handleRedo}
-        />
-      )}
-
-      {/* COLLAPSIBLE DIAGNOSTICS DRAWER (COMPACT 1-LINE FOOTER BY DEFAULT) */}
-      <footer className="bg-[#08090C] border-t border-[#1F2433] shrink-0">
-        <div className="px-5 py-1.5 flex items-center justify-between text-[11px] font-mono bg-[#0E1017]">
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="text-slate-400 flex items-center gap-1.5 shrink-0">
-              <Terminal className="w-3.5 h-3.5 text-[#D4AF37]" />
-              Diagnostics ({logs.length})
-            </span>
-            {logs[0] && (
-              <span className="text-slate-300 truncate">
-                {logs[0].message}
-              </span>
-            )}
-          </div>
-          <button
-            onClick={() => setShowConsoleLogs(!showConsoleLogs)}
-            className="text-slate-400 hover:text-white shrink-0 ml-4"
-          >
-            {showConsoleLogs ? 'Hide Logs' : 'Show Logs'}
-          </button>
-        </div>
-        {showConsoleLogs && (
-          <div className="h-28 overflow-y-auto px-5 py-2 space-y-1 font-mono text-[11px]">
-            {logs.map((log) => (
-              <div key={log.id} className="flex items-start gap-2">
-                <span className="text-slate-500 shrink-0">[{log.timestamp}]</span>
-                <span className="px-1.5 rounded bg-white/5 text-[#D4AF37] shrink-0">{log.stage}</span>
-                <span
-                  className={
-                    log.level === 'error'
-                      ? 'text-rose-400'
-                      : log.level === 'warning'
-                        ? 'text-amber-300'
-                        : log.level === 'success'
-                          ? 'text-emerald-300'
-                          : 'text-slate-300'
-                  }
-                >
-                  {log.message}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-      </footer>
-
-      {/* API Configuration Modal */}
-      <ApiConfigModal
-        isOpen={isConfigOpen}
-        onClose={() => setIsConfigOpen(false)}
-        credentials={credentials}
-        onSaveCredentials={handleSaveCredentials}
-      />
-
-      {/* Raw Scribe v2 JSON Modal */}
-      {showRawScribeModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-          <div className="bg-[#12151E] border border-[#262B3D] rounded-xl max-w-3xl w-full max-h-[80vh] flex flex-col overflow-hidden">
-            <div className="px-5 py-3 border-b border-[#262B3D] flex items-center justify-between">
-              <span className="text-xs font-mono font-bold text-[#D4AF37]">
-                PRESERVED TRANSCRIPTION RAW PAYLOAD
-              </span>
-              <button
-                onClick={() => setShowRawScribeModal(false)}
-                className="text-xs text-slate-400 hover:text-white"
-              >
-                Close
-              </button>
-            </div>
-            <pre className="p-4 text-xs font-mono text-emerald-300 overflow-auto flex-1 bg-[#0B0C10]">
-              {rawScribeResponseJson || 'No payload recorded yet.'}
-            </pre>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default App;
+                        <div>
+                          <label className="block text-[11px] text-slate-400 mb-1">
+                            Assigned ElevenLabs Voice {char.is_voice_locked && '(Unlock to change)'}
+                          </label>
+                          <select
+                            disabled={char.is_voice_locked}
+                            value={char.assigned_voice_id}
+                            onChange={(e) => {
+                              const vId = e.target.value;
+                              const vObj = availableVoices.find((v) => v.voice_id === vId);
+                              setCharacters((prev) =>
+                                prev.map((c) =>
+                                  c.character_id === char.character_id
+                                    ? {
+                                        ...c,
+                               
