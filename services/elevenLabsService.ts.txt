@@ -5,8 +5,7 @@ import {
   ElevenLabsVoice,
   SourceEngine,
   ReviewStatus,
-  TimingStatus,
-  TtsEngineMode
+  TimingStatus
 } from '../types';
 
 export interface ScribeTranscriptionResult {
@@ -14,7 +13,6 @@ export interface ScribeTranscriptionResult {
   detectedLanguage: 'en' | 'km';
   segments: DialogueSegment[];
   characters: CharacterProfile[];
-  usedFallbackEngine?: boolean;
 }
 
 export class ElevenLabsAccountRestrictionError extends Error {
@@ -29,40 +27,9 @@ export class ElevenLabsAccountRestrictionError extends Error {
   }
 }
 
-const DEFAULT_FALLBACK_VOICES: ElevenLabsVoice[] = [
-  {
-    voice_id: 'pNInz6obpgDQGcFmaJgB',
-    name: 'Adam (Multilingual v2)',
-    category: 'premade',
-    labels: { accent: 'neutral', use_case: 'cinematic', gender: 'male' },
-    description: 'Deep, authoritative voice suited for leading roles'
-  },
-  {
-    voice_id: 'EXAVITQu4vr4xnSDxMaL',
-    name: 'Sarah (Multilingual v2)',
-    category: 'premade',
-    labels: { accent: 'neutral', use_case: 'conversational', gender: 'female' },
-    description: 'Clear, expressive voice for natural dialogue'
-  },
-  {
-    voice_id: 'onwK4e9ZLuTAKqWW03F9',
-    name: 'Daniel (Multilingual v2)',
-    category: 'premade',
-    labels: { accent: 'british', use_case: 'narration', gender: 'male' },
-    description: 'Warm, resonant voice for elder or mentor characters'
-  },
-  {
-    voice_id: 'Xb7hH8MSUJpSbSDYk0k2',
-    name: 'Alice (Multilingual v2)',
-    category: 'premade',
-    labels: { accent: 'neutral', use_case: 'dramatic', gender: 'female' },
-    description: 'Warm and confident character voice'
-  }
-];
-
 /**
- * Extracts a compact 16kHz Mono WAV file from a video or audio File in the browser.
- * This prevents Scribe v2 / Whisper upload timeouts and container codec errors on large movie files.
+ * Extracts a compact 16kHz Mono WAV file from a video or audio File in the browser
+ * so large movie files can be uploaded reliably to ElevenLabs Scribe v2.
  */
 export async function extractCompactAudioWavFromFile(
   mediaFile: File,
@@ -72,7 +39,7 @@ export async function extractCompactAudioWavFromFile(
     return mediaFile;
   }
 
-  onProgress?.('Extracting 16kHz mono PCM audio track from media container for reliable transcription...');
+  onProgress?.('Extracting 16kHz mono PCM audio track from media container for Scribe v2...');
   const arrayBuffer = await mediaFile.arrayBuffer();
   const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
 
@@ -146,7 +113,7 @@ function parseElevenLabsErrorDetail(status: number, rawText: string): {
     return {
       isUnusualActivityBlock: true,
       friendlyMessage:
-        'ElevenLabs 401 Block (detected_unusual_activity): Free Tier access is disabled by ElevenLabs when a VPN/Proxy or shared IP is detected. Disable VPN, use a paid ElevenLabs key, or use the Built-in Acoustic Synth / Gemini Audio Fallback.'
+        'ElevenLabs 401 Block (detected_unusual_activity): Free Tier access is disabled by ElevenLabs when a VPN/Proxy or shared IP is detected. Please disable VPN or use a paid ElevenLabs API key in Settings.'
     };
   }
 
@@ -158,8 +125,6 @@ function parseElevenLabsErrorDetail(status: number, rawText: string): {
 
 /**
  * Calls POST https://api.elevenlabs.io/v1/speech-to-text with Scribe v2.
- * Includes automatic audio extraction, Khmer language_code retry (khm -> auto-detect),
- * and model_id retry (scribe_v2 -> scribe_v1).
  */
 export async function transcribeWithElevenLabsScribe2(
   mediaFile: File,
@@ -168,7 +133,7 @@ export async function transcribeWithElevenLabsScribe2(
   onProgress?: (operation: string) => void
 ): Promise<ScribeTranscriptionResult> {
   if (!apiKey.trim()) {
-    throw new Error('ElevenLabs API key is required to invoke POST https://api.elevenlabs.io/v1/speech-to-text');
+    throw new Error('ElevenLabs API key is required. Open Settings and enter your ElevenLabs API key to run Scribe v2.');
   }
 
   const uploadReadyFile = await extractCompactAudioWavFromFile(mediaFile, onProgress);
@@ -177,14 +142,13 @@ export async function transcribeWithElevenLabsScribe2(
     languageHint === 'km'
       ? [
           { modelId: 'scribe_v2', langCode: 'khm', label: 'Scribe v2 (Khmer ISO-639-3: khm)' },
-          { modelId: 'scribe_v2', langCode: null, label: 'Scribe v2 (Auto-Language Identification for Khmer)' },
-          { modelId: 'scribe_v1', langCode: 'khm', label: 'Scribe v1 Compatibility (khm)' },
-          { modelId: 'scribe_v1', langCode: null, label: 'Scribe v1 Compatibility (Auto-Detect)' }
+          { modelId: 'scribe_v2', langCode: null, label: 'Scribe v2 (Auto-Language Identification)' },
+          { modelId: 'scribe_v1', langCode: 'khm', label: 'Scribe v1 (khm)' }
         ]
       : [
           { modelId: 'scribe_v2', langCode: 'eng', label: 'Scribe v2 (English: eng)' },
           { modelId: 'scribe_v2', langCode: null, label: 'Scribe v2 (Auto-Language Identification)' },
-          { modelId: 'scribe_v1', langCode: null, label: 'Scribe v1 Compatibility' }
+          { modelId: 'scribe_v1', langCode: null, label: 'Scribe v1' }
         ];
 
   let lastErrorText = '';
@@ -214,7 +178,7 @@ export async function transcribeWithElevenLabsScribe2(
     if (response.ok) {
       const rawData = await response.json();
       const rawResponseJson = JSON.stringify(rawData, null, 2);
-      onProgress?.('Normalizing Scribe word-level timestamps & Khmer/English script segmentation...');
+      onProgress?.('Normalizing Scribe word-level timestamps & speaker diarization...');
       return normalizeScribePayloadToInternalSchema(rawData, rawResponseJson, languageHint);
     }
 
@@ -237,7 +201,6 @@ export async function transcribeWithElevenLabsScribe2(
 
 /**
  * Normalizes Scribe v2 response into WordEvents, DialogueSegments, and CharacterProfiles.
- * Handles both space-delimited English tokens and continuous Cambodian Khmer script (ក-៿).
  */
 export function normalizeScribePayloadToInternalSchema(
   rawData: Record<string, unknown>,
@@ -473,12 +436,10 @@ export function normalizeScribePayloadToInternalSchema(
   }
 
   const speakerMap = new Map<string, CharacterProfile>();
-  const defaultVoices = DEFAULT_FALLBACK_VOICES;
 
   segments.forEach((seg, idx) => {
     const existing = speakerMap.get(seg.speaker_id);
     if (!existing) {
-      const voicePreset = defaultVoices[speakerMap.size % defaultVoices.length];
       speakerMap.set(seg.speaker_id, {
         character_id: seg.character_id,
         original_speaker_id: seg.speaker_id,
@@ -488,14 +449,14 @@ export function normalizeScribePayloadToInternalSchema(
         voice_description: `Detected speaker ${seg.speaker_id} from Scribe diarization`,
         perceived_vocal_presentation: 'Diarized Speaker Track',
         relationship_context: 'Scene participant',
-        assigned_voice_id: voicePreset.voice_id,
-        assigned_voice_name: voicePreset.name,
-        is_voice_locked: true,
+        assigned_voice_id: '',
+        assigned_voice_name: 'Unassigned — Select ElevenLabs Voice',
+        is_voice_locked: false,
         target_language_compatibility: 'verified_multilingual_v2',
         pronunciation_notes: '',
-        voice_consistency_notes: 'Locked via Voice Vault',
+        voice_consistency_notes: '',
         audition_audio_base64: null,
-        review_status: ReviewStatus.VERIFIED
+        review_status: ReviewStatus.PENDING
       });
     } else {
       existing.dialogue_count += 1;
@@ -516,9 +477,12 @@ export function normalizeScribePayloadToInternalSchema(
   };
 }
 
+/**
+ * Syncs real available voices from GET https://api.elevenlabs.io/v1/voices
+ */
 export async function fetchElevenLabsVoices(apiKey: string): Promise<ElevenLabsVoice[]> {
   if (!apiKey.trim()) {
-    return DEFAULT_FALLBACK_VOICES;
+    return [];
   }
 
   const response = await fetch('https://api.elevenlabs.io/v1/voices', {
@@ -528,12 +492,13 @@ export async function fetchElevenLabsVoices(apiKey: string): Promise<ElevenLabsV
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch ElevenLabs voices (${response.status})`);
+    const errText = await response.text();
+    throw new Error(`Failed to fetch ElevenLabs voices (${response.status}): ${errText}`);
   }
 
   const data = await response.json();
   if (!Array.isArray(data.voices)) {
-    return DEFAULT_FALLBACK_VOICES;
+    return [];
   }
 
   return data.voices.map((v: Record<string, unknown>) => ({
@@ -546,27 +511,28 @@ export async function fetchElevenLabsVoices(apiKey: string): Promise<ElevenLabsV
   }));
 }
 
+/**
+ * Generates real speech via ElevenLabs TTS and measures the actual decoded audio duration.
+ * No fake or synthetic acoustic fallback is used.
+ */
 export async function synthesizeSpeechAndMeasureDuration(params: {
   text: string;
   voiceId: string;
   apiKey: string;
   modelId: string;
-  ttsEngineMode?: TtsEngineMode;
   stability?: number;
   similarityBoost?: number;
 }): Promise<{
   audioBase64: string;
   mimeType: string;
   actualDurationSeconds: number;
-  engineUsed: 'elevenlabs' | 'local_acoustic_fallback';
-  fallbackReason?: string;
+  engineUsed: 'elevenlabs';
 }> {
   const {
     text,
     voiceId,
     apiKey,
     modelId,
-    ttsEngineMode = 'elevenlabs_with_fallback',
     stability = 0.55,
     similarityBoost = 0.78
   } = params;
@@ -575,12 +541,12 @@ export async function synthesizeSpeechAndMeasureDuration(params: {
     throw new Error('Cannot synthesize empty dialogue text.');
   }
 
-  if (ttsEngineMode === 'local_acoustic_synth' || !apiKey.trim()) {
-    const localWav = await generateAcousticRehearsalWav(text, voiceId);
-    return {
-      ...localWav,
-      engineUsed: 'local_acoustic_fallback'
-    };
+  if (!apiKey.trim()) {
+    throw new Error('ElevenLabs API key is required for speech synthesis. Open Settings and enter your ElevenLabs API key.');
+  }
+
+  if (!voiceId.trim()) {
+    throw new Error('No ElevenLabs voice is assigned to this character. Please select a voice in Stage 2 (Verify Speakers).');
   }
 
   const response = await fetch(
@@ -607,16 +573,6 @@ export async function synthesizeSpeechAndMeasureDuration(params: {
   if (!response.ok) {
     const errText = await response.text();
     const parsedErr = parseElevenLabsErrorDetail(response.status, errText);
-
-    if (ttsEngineMode === 'elevenlabs_with_fallback') {
-      const localWav = await generateAcousticRehearsalWav(text, voiceId);
-      return {
-        ...localWav,
-        engineUsed: 'local_acoustic_fallback',
-        fallbackReason: parsedErr.friendlyMessage
-      };
-    }
-
     throw new ElevenLabsAccountRestrictionError(
       parsedErr.friendlyMessage,
       response.status,
@@ -654,66 +610,4 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
-}
-
-export async function generateAcousticRehearsalWav(
-  text: string,
-  voiceId: string
-): Promise<{
-  audioBase64: string;
-  mimeType: string;
-  actualDurationSeconds: number;
-}> {
-  const cleanChars = text.replace(/\s+/g, '').length;
-  const durationSec = Number(Math.max(1.1, Math.min(9.5, cleanChars * 0.068)).toFixed(3));
-  const sampleRate = 24000;
-  const numSamples = Math.floor(sampleRate * durationSec);
-  const buffer = new ArrayBuffer(44 + numSamples * 2);
-  const view = new DataView(buffer);
-
-  const writeStr = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  };
-
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + numSamples * 2, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, 'data');
-  view.setUint32(40, numSamples * 2, true);
-
-  let baseFreq = 140;
-  for (let i = 0; i < voiceId.length; i++) {
-    baseFreq += voiceId.charCodeAt(i) % 7;
-  }
-
-  for (let i = 0; i < numSamples; i++) {
-    const t = i / sampleRate;
-    const syllableEnvelope = Math.max(0, Math.sin(t * Math.PI * 5.2));
-    const f0 = baseFreq + Math.sin(t * 6) * 18;
-    const sample =
-      (Math.sin(2 * Math.PI * f0 * t) * 0.6 +
-        Math.sin(2 * Math.PI * f0 * 2 * t) * 0.25 +
-        Math.sin(2 * Math.PI * f0 * 3 * t) * 0.15) *
-      syllableEnvelope *
-      0.32;
-    const pcm = Math.max(-1, Math.min(1, sample)) * 32767;
-    view.setInt16(44 + i * 2, pcm, true);
-  }
-
-  const actualDurationSeconds = await measureArrayBufferAudioDuration(buffer);
-  return {
-    audioBase64: arrayBufferToBase64(buffer),
-    mimeType: 'audio/wav',
-    actualDurationSeconds
-  };
 }
