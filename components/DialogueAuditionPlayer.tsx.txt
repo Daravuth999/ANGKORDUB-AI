@@ -1,0 +1,454 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  Volume2,
+  VolumeX,
+  RefreshCw,
+  CheckCircle2,
+  AlertTriangle,
+  Sparkles,
+  ArrowLeftRight,
+  ListMusic
+} from 'lucide-react';
+import { DialogueSegment, CharacterProfile, TimingStatus } from '../types';
+
+interface DialogueAuditionPlayerProps {
+  segment: DialogueSegment | null;
+  allSegments: DialogueSegment[];
+  character: CharacterProfile | undefined;
+  isSynthesizing: boolean;
+  synthesisError: string | null;
+  onSynthesizeSegment: (segmentId: string) => Promise<void>;
+  onPlayOriginalWindow: (segment: DialogueSegment) => void;
+  onSelectSegment: (segmentId: string) => void;
+}
+
+export const DialogueAuditionPlayer: React.FC<DialogueAuditionPlayerProps> = ({
+  segment,
+  allSegments,
+  character,
+  isSynthesizing,
+  synthesisError,
+  onSynthesizeSegment,
+  onPlayOriginalWindow,
+  onSelectSegment
+}) => {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [isPlayingDub, setIsPlayingDub] = useState<boolean>(false);
+  const [clipCurrentTime, setClipCurrentTime] = useState<number>(0);
+  const [clipDuration, setClipDuration] = useState<number>(0);
+  const [volume, setVolume] = useState<number>(1.0);
+  const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [isComparingAB, setIsComparingAB] = useState<boolean>(false);
+  const [isPlayingAllQueue, setIsPlayingAllQueue] = useState<boolean>(false);
+
+  const hasValidAudio = Boolean(segment?.synthesized_audio_base64);
+  const isOutdatedAudio = Boolean(segment?.needs_resynthesis && hasValidAudio);
+
+  // Sync audio element source when segment or synthesized audio changes
+  useEffect(() => {
+    setIsPlayingDub(false);
+    setClipCurrentTime(0);
+    setPlaybackError(null);
+
+    if (!audioRef.current) return;
+    if (segment?.synthesized_audio_base64) {
+      const raw = segment.synthesized_audio_base64.trim();
+      const srcUrl = raw.startsWith('data:')
+        ? raw
+        : `data:${segment.synthesized_audio_mime || 'audio/wav'};base64,${raw}`;
+      audioRef.current.src = srcUrl;
+      audioRef.current.playbackRate = segment.playback_rate_adjustment || 1.0;
+      audioRef.current.volume = isMuted ? 0 : volume;
+      audioRef.current.load();
+    } else {
+      audioRef.current.removeAttribute('src');
+    }
+  }, [
+    segment?.segment_id,
+    segment?.synthesized_audio_base64,
+    segment?.synthesized_audio_mime,
+    segment?.playback_rate_adjustment,
+    isMuted,
+    volume
+  ]);
+
+  const handleTogglePlayDub = async () => {
+    if (!audioRef.current || !segment?.synthesized_audio_base64) return;
+    setPlaybackError(null);
+
+    if (isPlayingDub) {
+      audioRef.current.pause();
+      setIsPlayingDub(false);
+      setIsPlayingAllQueue(false);
+      return;
+    }
+
+    try {
+      audioRef.current.playbackRate = segment.playback_rate_adjustment || 1.0;
+      await audioRef.current.play();
+      setIsPlayingDub(true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Browser could not decode or play audio asset.';
+      setPlaybackError(`Audio playback failed: ${msg}`);
+      setIsPlayingDub(false);
+    }
+  };
+
+  const handleReplayDub = async () => {
+    if (!audioRef.current || !segment?.synthesized_audio_base64) return;
+    setPlaybackError(null);
+    audioRef.current.currentTime = 0;
+    setClipCurrentTime(0);
+    try {
+      audioRef.current.playbackRate = segment.playback_rate_adjustment || 1.0;
+      await audioRef.current.play();
+      setIsPlayingDub(true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Browser could not play audio asset.';
+      setPlaybackError(msg);
+    }
+  };
+
+  // A/B Comparison: Plays Original Video/Audio Window, then immediately plays Synthesized Khmer Audio
+  const handleRunABComparison = () => {
+    if (!segment) return;
+    setIsComparingAB(true);
+    onPlayOriginalWindow(segment);
+
+    const windowMs = Math.max(900, (segment.source_end - segment.source_start) * 1000 + 250);
+    window.setTimeout(() => {
+      setIsComparingAB(false);
+      if (segment.synthesized_audio_base64) {
+        handleReplayDub();
+      }
+    }, windowMs);
+  };
+
+  // Play All Dubbed Dialogue sequentially across segments that have audio
+  const handleTogglePlayAllDubbed = async () => {
+    if (isPlayingAllQueue) {
+      setIsPlayingAllQueue(false);
+      if (audioRef.current) audioRef.current.pause();
+      setIsPlayingDub(false);
+      return;
+    }
+
+    const playableSegments = allSegments.filter((s) => Boolean(s.synthesized_audio_base64));
+    if (playableSegments.length === 0) {
+      setPlaybackError('No segments have synthesized audio yet. Click "Generate Audio" first.');
+      return;
+    }
+
+    setIsPlayingAllQueue(true);
+    const startIdx = playableSegments.findIndex((s) => s.segment_id === segment?.segment_id);
+    const targetSeg = playableSegments[startIdx >= 0 ? startIdx : 0];
+    onSelectSegment(targetSeg.segment_id);
+    setTimeout(() => {
+      handleReplayDub();
+    }, 120);
+  };
+
+  const handleAudioEnded = () => {
+    setIsPlayingDub(false);
+    if (isPlayingAllQueue && segment) {
+      const playableSegments = allSegments.filter((s) => Boolean(s.synthesized_audio_base64));
+      const curIdx = playableSegments.findIndex((s) => s.segment_id === segment.segment_id);
+      if (curIdx >= 0 && curIdx < playableSegments.length - 1) {
+        const nextSeg = playableSegments[curIdx + 1];
+        onSelectSegment(nextSeg.segment_id);
+        setTimeout(() => {
+          if (audioRef.current) {
+            audioRef.current.play().then(() => setIsPlayingDub(true)).catch(() => setIsPlayingAllQueue(false));
+          }
+        }, 180);
+      } else {
+        setIsPlayingAllQueue(false);
+      }
+    }
+  };
+
+  if (!segment) {
+    return (
+      <div className="p-4 rounded-xl bg-[#12151E] border border-[#222738] text-xs text-slate-400">
+        Select a dialogue segment to audition original and dubbed Khmer audio.
+      </div>
+    );
+  }
+
+  const effectiveDubDuration =
+    segment.actual_synthesized_duration !== null
+      ? Number((segment.actual_synthesized_duration / (segment.playback_rate_adjustment || 1.0)).toFixed(2))
+      : null;
+
+  const timingDelta =
+    effectiveDubDuration !== null
+      ? Number((effectiveDubDuration - segment.available_duration).toFixed(2))
+      : null;
+
+  return (
+    <div className="p-4 rounded-xl bg-[#12151E] border border-[#262B3D] space-y-3.5">
+      <audio
+        ref={audioRef}
+        onTimeUpdate={() => {
+          if (audioRef.current) setClipCurrentTime(audioRef.current.currentTime);
+        }}
+        onLoadedMetadata={() => {
+          if (audioRef.current && Number.isFinite(audioRef.current.duration)) {
+            setClipDuration(Number(audioRef.current.duration.toFixed(2)));
+          }
+        }}
+        onEnded={handleAudioEnded}
+        onError={() => {
+          if (hasValidAudio) {
+            setPlaybackError('Could not decode synthesized audio stream. Please click Regenerate Audio.');
+          }
+        }}
+        className="hidden"
+      />
+
+      {/* Top Header: Segment Status, Speaker & Voice */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1E2333] pb-2.5">
+        <div className="flex items-center gap-2">
+          <span className="px-2 py-0.5 rounded text-xs font-mono font-semibold bg-[#D4AF37]/15 text-[#D4AF37]">
+            {segment.segment_id}
+          </span>
+          <span className="text-xs font-semibold text-white">
+            {character?.character_name || segment.speaker_id}
+          </span>
+          <span className="text-xs text-slate-400">
+            • Voice: <strong className="text-slate-200">{character?.assigned_voice_name || 'Default'}</strong>
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {isOutdatedAudio ? (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-amber-500/20 text-amber-300 border border-amber-500/40">
+              <AlertTriangle className="w-3 h-3" /> Outdated Audio (Text Edited)
+            </span>
+          ) : hasValidAudio ? (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+              <CheckCircle2 className="w-3 h-3" /> Audio Ready for Audition
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-slate-800 text-slate-400">
+              Not Synthesized Yet
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Timing Metrics Bar: Source Window vs Dubbed Duration vs Delta */}
+      <div className="grid grid-cols-3 gap-2 bg-[#0B0C10] p-2.5 rounded-lg border border-[#1E2333] text-xs font-mono">
+        <div>
+          <span className="text-[10px] text-slate-400 block">SOURCE WINDOW</span>
+          <span className="text-sky-300 font-semibold">
+            {segment.available_duration.toFixed(2)}s ({segment.source_start.toFixed(1)}s–{segment.source_end.toFixed(1)}s)
+          </span>
+        </div>
+        <div>
+          <span className="text-[10px] text-slate-400 block">DUBBED AUDIO</span>
+          <span className="text-white font-semibold">
+            {effectiveDubDuration !== null ? `${effectiveDubDuration.toFixed(2)}s` : '—'}
+          </span>
+        </div>
+        <div>
+          <span className="text-[10px] text-slate-400 block">TIMING DELTA</span>
+          <span
+            className={`font-semibold ${
+              timingDelta === null
+                ? 'text-slate-500'
+                : segment.timing_status === TimingStatus.OVERFLOW_FAILED
+                  ? 'text-rose-400'
+                  : segment.timing_status === TimingStatus.WARNING
+                    ? 'text-amber-300'
+                    : 'text-emerald-400'
+            }`}
+          >
+            {timingDelta !== null
+              ? `${timingDelta > 0 ? '+' : ''}${timingDelta.toFixed(2)}s (${segment.timing_status.replace('_failed', '')})`
+              : 'Unmeasured'}
+          </span>
+        </div>
+      </div>
+
+      {/* Warning if Text Changed After Synthesis */}
+      {isOutdatedAudio && (
+        <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-2 text-xs text-amber-200">
+          <span>
+            The Khmer text or voice was modified after this audio clip was generated. Regenerate to hear the updated dialogue.
+          </span>
+          <button
+            onClick={() => onSynthesizeSegment(segment.segment_id)}
+            disabled={isSynthesizing}
+            className="px-3 py-1 rounded bg-amber-400 text-[#0B0C10] font-semibold shrink-0 hover:bg-amber-300"
+          >
+            {isSynthesizing ? 'Regenerating...' : 'Regenerate Now'}
+          </button>
+        </div>
+      )}
+
+      {/* Synthesis or Playback Error Banner with Retry */}
+      {(synthesisError || playbackError) && (
+        <div className="p-2.5 rounded-lg bg-rose-500/15 border border-rose-500/40 flex items-center justify-between gap-2 text-xs text-rose-200">
+          <span>{synthesisError || playbackError}</span>
+          <button
+            onClick={() => onSynthesizeSegment(segment.segment_id)}
+            className="px-2.5 py-1 rounded bg-rose-500 text-white font-semibold shrink-0 hover:bg-rose-400"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Primary Audition Deck Controls */}
+      {hasValidAudio ? (
+        <div className="bg-[#0B0C10] p-3 rounded-xl border border-[#222738] space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleTogglePlayDub}
+                className="px-3.5 py-1.5 rounded-lg bg-[#D4AF37] hover:bg-[#e5c247] text-[#0B0C10] text-xs font-bold flex items-center gap-1.5 shadow"
+              >
+                {isPlayingDub ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{isPlayingDub ? 'Pause Khmer Audio' : 'Play Khmer Audio'}</span>
+              </button>
+
+              <button
+                onClick={handleReplayDub}
+                className="p-1.5 rounded-lg bg-[#161A26] hover:bg-[#1F2536] text-slate-300 hover:text-white border border-[#262B3D]"
+                title="Replay Khmer Audio from Start"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                onClick={() => onPlayOriginalWindow(segment)}
+                className="px-3 py-1.5 rounded-lg bg-[#161A26] hover:bg-[#1F2536] text-sky-300 border border-sky-500/30 text-xs font-medium flex items-center gap-1.5"
+                title="Play the original source video & audio for this segment's exact time window"
+              >
+                <Play className="w-3 h-3" />
+                <span>Original Window</span>
+              </button>
+
+              <button
+                onClick={handleRunABComparison}
+                disabled={isComparingAB}
+                className="px-3 py-1.5 rounded-lg bg-purple-500/15 hover:bg-purple-500/25 text-purple-200 border border-purple-500/30 text-xs font-medium flex items-center gap-1.5"
+                title="Play Original Source Window followed immediately by Dubbed Khmer Audio"
+              >
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+                <span>{isComparingAB ? 'Playing A → B...' : 'A/B Compare'}</span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleTogglePlayAllDubbed}
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 border ${
+                  isPlayingAllQueue
+                    ? 'bg-emerald-500/25 border-emerald-400 text-emerald-200'
+                    : 'bg-[#161A26] border-[#262B3D] text-slate-300 hover:text-white'
+                }`}
+                title="Sequentially audition all generated Khmer dialogue clips"
+              >
+                <ListMusic className="w-3.5 h-3.5" />
+                <span>{isPlayingAllQueue ? 'Stop Queue' : 'Play All Dubs'}</span>
+              </button>
+
+              <button
+                onClick={() => onSynthesizeSegment(segment.segment_id)}
+                disabled={isSynthesizing}
+                className="px-2.5 py-1.5 rounded-lg bg-[#161A26] hover:bg-[#1F2536] border border-[#2C3347] text-xs text-slate-200 flex items-center gap-1"
+              >
+                <RefreshCw className={`w-3 h-3 text-[#D4AF37] ${isSynthesizing ? 'animate-spin' : ''}`} />
+                <span>{isSynthesizing ? 'Generating...' : 'Regenerate'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Interactive Seek Bar & Volume Control */}
+          <div className="flex items-center gap-3 pt-1">
+            <span className="font-mono text-[11px] text-[#D4AF37] w-10">
+              {clipCurrentTime.toFixed(2)}s
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0.1, clipDuration || segment.actual_synthesized_duration || 1)}
+              step={0.02}
+              value={clipCurrentTime}
+              onChange={(e) => {
+                const nextTime = Number(e.target.value);
+                setClipCurrentTime(nextTime);
+                if (audioRef.current) {
+                  audioRef.current.currentTime = nextTime;
+                }
+              }}
+              className="flex-1 accent-[#D4AF37] h-1.5 cursor-pointer"
+              aria-label="Seek dubbed audio"
+            />
+            <span className="font-mono text-[11px] text-slate-400 w-10 text-right">
+              {(clipDuration || segment.actual_synthesized_duration || 0).toFixed(2)}s
+            </span>
+
+            <div className="flex items-center gap-1.5 pl-2 border-l border-[#222738]">
+              <button
+                onClick={() => setIsMuted(!isMuted)}
+                className="text-slate-400 hover:text-white"
+                aria-label="Toggle mute"
+              >
+                {isMuted ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5" />}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={isMuted ? 0 : volume}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setVolume(v);
+                  setIsMuted(v === 0);
+                  if (audioRef.current) audioRef.current.volume = v;
+                }}
+                className="w-14 accent-[#D4AF37] h-1 cursor-pointer"
+                aria-label="Audio volume"
+              />
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="p-4 rounded-xl bg-[#0B0C10] border border-dashed border-[#2C3347] flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold text-white">
+              No Khmer Audio Generated for {segment.segment_id} Yet
+            </div>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              Generate speech now to hear the actual Khmer voice performance and measure its duration.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onPlayOriginalWindow(segment)}
+              className="px-3 py-1.5 rounded-lg bg-[#161A26] hover:bg-[#1F2536] text-sky-300 border border-sky-500/30 text-xs font-medium flex items-center gap-1.5"
+            >
+              <Play className="w-3 h-3" /> Play Original
+            </button>
+            <button
+              onClick={() => onSynthesizeSegment(segment.segment_id)}
+              disabled={isSynthesizing}
+              className="px-4 py-1.5 rounded-lg bg-[#D4AF37] hover:bg-[#e5c247] text-[#0B0C10] text-xs font-bold flex items-center gap-1.5 shadow"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>{isSynthesizing ? 'Generating Audio...' : 'Generate Audio Now'}</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

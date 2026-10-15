@@ -1,0 +1,90 @@
+import { DialogueSegment, TimingStatus } from '../types';
+
+export interface TimingAnalysisReport {
+  updatedSegments: DialogueSegment[];
+  passedCount: number;
+  warningCount: number;
+  failedOverflowCount: number;
+  unmeasuredCount: number;
+}
+
+/**
+ * Evaluates actual synthesized audio duration against Scribe's available timeline window
+ * and checks for collisions with the subsequent dialogue segment.
+ * Never overwrites Scribe's immutable source_start or source_end.
+ */
+export function evaluateTimelineDurationAlignment(
+  segments: DialogueSegment[]
+): TimingAnalysisReport {
+  let passedCount = 0;
+  let warningCount = 0;
+  let failedOverflowCount = 0;
+  let unmeasuredCount = 0;
+
+  const updatedSegments = segments.map((seg, idx) => {
+    const nextSeg = idx < segments.length - 1 ? segments[idx + 1] : null;
+    const availableWindow = Number((seg.source_end - seg.source_start).toFixed(3));
+
+    if (seg.actual_synthesized_duration === null || seg.actual_synthesized_duration <= 0) {
+      unmeasuredCount++;
+      return {
+        ...seg,
+        available_duration: availableWindow,
+        timing_status: TimingStatus.UNMEASURED,
+        overlap_seconds: 0
+      };
+    }
+
+    const effectiveDuration = Number(
+      (seg.actual_synthesized_duration / (seg.playback_rate_adjustment || 1.0)).toFixed(3)
+    );
+    const proposedEnd = Number((seg.proposed_dubbed_start + effectiveDuration).toFixed(3));
+    const windowDelta = Number((effectiveDuration - availableWindow).toFixed(3));
+
+    // Check if proposed end collides with the next segment's start time
+    const nextStart = nextSeg ? nextSeg.proposed_dubbed_start : Infinity;
+    const collisionWithNext = proposedEnd > nextStart ? Number((proposedEnd - nextStart).toFixed(3)) : 0;
+
+    let status = TimingStatus.PASSED;
+    let reviewRequired = seg.review_required;
+    let reviewReason = seg.review_reason;
+
+    if (collisionWithNext > 0.05) {
+      status = TimingStatus.OVERFLOW_FAILED;
+      failedOverflowCount++;
+      reviewRequired = true;
+      reviewReason = `Synthesized speech overlaps next dialogue line (${nextSeg?.segment_id}) by +${collisionWithNext.toFixed(2)}s.`;
+    } else if (windowDelta > 0.45) {
+      status = TimingStatus.OVERFLOW_FAILED;
+      failedOverflowCount++;
+      reviewRequired = true;
+      reviewReason = `Synthesized duration (${effectiveDuration.toFixed(2)}s) exceeds source window (${availableWindow.toFixed(2)}s) by +${windowDelta.toFixed(2)}s.`;
+    } else if (windowDelta > 0.15 || seg.playback_rate_adjustment > 1.1) {
+      status = TimingStatus.WARNING;
+      warningCount++;
+    } else {
+      status = TimingStatus.PASSED;
+      passedCount++;
+    }
+
+    return {
+      ...seg,
+      available_duration: availableWindow,
+      proposed_dubbed_end: proposedEnd,
+      final_approved_start: seg.proposed_dubbed_start,
+      final_approved_end: proposedEnd,
+      timing_status: status,
+      overlap_seconds: Math.max(0, windowDelta, collisionWithNext),
+      review_required: reviewRequired,
+      review_reason: reviewReason
+    };
+  });
+
+  return {
+    updatedSegments,
+    passedCount,
+    warningCount,
+    failedOverflowCount,
+    unmeasuredCount
+  };
+}

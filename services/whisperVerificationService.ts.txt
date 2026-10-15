@@ -1,0 +1,100 @@
+import { DialogueSegment, WhisperDisagreement } from '../types';
+
+export interface WhisperVerificationConfig {
+  endpointUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+/**
+ * Runs an optional second-pass Whisper transcription or compares with a Whisper-compatible endpoint
+ * without overwriting Scribe v2 timing anchors.
+ */
+export async function runOptionalWhisperVerification(
+  mediaFile: File | null,
+  scribeSegments: DialogueSegment[],
+  config: WhisperVerificationConfig,
+  onProgress?: (msg: string) => void
+): Promise<WhisperDisagreement[]> {
+  if (!config.endpointUrl.trim() || !config.apiKey.trim() || !mediaFile) {
+    throw new Error(
+      'To execute live external Whisper API verification, provide a valid Whisper-compatible Endpoint URL, API key, and loaded media file.'
+    );
+  }
+
+  onProgress?.(`Sending audio to Whisper verification endpoint (${config.model})...`);
+
+  const formData = new FormData();
+  formData.append('file', mediaFile);
+  formData.append('model', config.model || 'whisper-1');
+  formData.append('response_format', 'verbose_json');
+
+  const response = await fetch(config.endpointUrl.trim(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.apiKey.trim()}`
+    },
+    body: formData
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Whisper Verification Endpoint Error (${response.status}): ${errText}`);
+  }
+
+  const whisperData = await response.json();
+  const whisperSegments: Array<{ start: number; end: number; text: string }> = Array.isArray(
+    whisperData.segments
+  )
+    ? whisperData.segments
+    : [];
+
+  onProgress?.('Reconciling Whisper transcript against Scribe v2 source-of-truth timing anchors...');
+
+  return reconcileTranscriptsWithoutDestroyingScribe(scribeSegments, whisperSegments);
+}
+
+export function reconcileTranscriptsWithoutDestroyingScribe(
+  scribeSegments: DialogueSegment[],
+  whisperSegments: Array<{ start: number; end: number; text: string }>
+): WhisperDisagreement[] {
+  const disagreements: WhisperDisagreement[] = [];
+
+  scribeSegments.forEach((sSeg) => {
+    // Find overlapping Whisper segments
+    const overlapping = whisperSegments.filter(
+      (w) => w.end > sSeg.source_start + 0.15 && w.start < sSeg.source_end - 0.15
+    );
+    if (overlapping.length === 0) return;
+
+    const whisperCombined = overlapping
+      .map((o) => o.text.trim())
+      .join(' ')
+      .trim();
+
+    const normScribe = sSeg.original_text.toLowerCase().replace(/[^a-z0-9ក-៿\s]/g, '').trim();
+    const normWhisper = whisperCombined.toLowerCase().replace(/[^a-z0-9ក-៿\s]/g, '').trim();
+
+    if (normScribe && normWhisper && normScribe !== normWhisper) {
+      const hasCapitalProperName = /[A-Z][a-z]{2,}/.test(sSeg.original_text);
+      disagreements.push({
+        id: `dis_${sSeg.segment_id}_${Date.now()}`,
+        segment_id: sSeg.segment_id,
+        timestamp_start: sSeg.source_start,
+        timestamp_end: sSeg.source_end,
+        scribe_text: sSeg.original_text,
+        whisper_text: whisperCombined,
+        disagreement_type:
+          sSeg.language === 'km'
+            ? 'khmer_segmentation'
+            : hasCapitalProperName
+              ? 'proper_name'
+              : 'word_mismatch',
+        proposed_correction: sSeg.original_text,
+        resolved: false
+      });
+    }
+  });
+
+  return disagreements;
+}

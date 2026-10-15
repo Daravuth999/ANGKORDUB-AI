@@ -1,0 +1,258 @@
+import React from 'react';
+import { X, ShieldAlert, Key, CheckCircle2, Globe, Cpu, Volume2 } from 'lucide-react';
+import { ApiCredentials, TtsEngineMode } from '../types';
+
+interface ApiConfigModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  credentials: ApiCredentials;
+  onSaveCredentials: (updated: ApiCredentials) => void;
+}
+
+export const ApiConfigModal: React.FC<ApiConfigModalProps> = ({
+  isOpen,
+  onClose,
+  credentials,
+  onSaveCredentials
+}) => {
+  const [draft, setDraft] = React.useState<ApiCredentials>(credentials);
+
+  React.useEffect(() => {
+    setDraft(credentials);
+  }, [credentials, isOpen]);
+
+  if (!isOpen) return null;
+
+  const handleSave = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSaveCredentials(draft);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+      <div className="bg-[#12151E] border border-[#262B3D] rounded-xl max-w-2xl w-full shadow-2xl overflow-hidden">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#262B3D] bg-[#161922]">
+          <div className="flex items-center gap-2.5">
+            <Key className="w-5 h-5 text-[#D4AF37]" />
+            <h2 className="text-base font-semibold tracking-tight text-white">
+              Production API Engines & Fallback Configuration
+            </h2>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5"
+            aria-label="Close settings"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSave} className="p-6 space-y-5 max-h-[82vh] overflow-y-auto">
+          {/* Gemini 2.5 Flash Engine Configuration (Pre-configured + Optional Custom Key Override) */}
+          <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <Cpu className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="text-xs font-semibold text-emerald-300">
+                    Gemini 2.5 Flash Engine (Khmer Localization & Audio Transcription Fallback)
+                  </div>
+                  <div className="text-[11px] text-slate-300 mt-0.5 leading-relaxed">
+                    Works out-of-the-box using the built-in environment credential, or you can enter your own Gemini API key below.
+                  </div>
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 shrink-0">
+                <CheckCircle2 className="w-3.5 h-3.5" />{' '}
+                {draft.customGeminiApiKey?.trim() ? 'Custom Key Active' : 'Built-in Key Active'}
+              </span>
+            </div>
+
+            <label className="block">
+              <span className="text-[11px] font-medium text-emerald-200/90">
+                Optional Custom Gemini API Key (Leave blank to use built-in environment key)
+              </span>
+              <input
+                type="password"
+                value={draft.customGeminiApiKey || ''}
+                onChange={(e) => setDraft({ ...draft, customGeminiApiKey: e.target.value })}
+                placeholder="AIzaSy... (Optional — overrides built-in Gemini key when provided)"
+                className="mt-1 w-full px-3.5 py-2 rounded-lg bg-[#0B0C10] border border-emerald-500/30 text-xs text-white font-mono focus:outline-none focus:border-emerald-400"
+              />
+            </label>
+          </div>
+
+          {/* ElevenLabs Scribe v2 & TTS Key + 401 Unusual Activity Resolution */}
+          <div className="space-y-3 border-t border-[#262B3D] pt-4">
+            <label className="block">
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center justify-between">
+                <span>1. ElevenLabs API Key (Scribe v2 & TTS)</span>
+                <span className="text-[11px] font-mono text-[#D4AF37]">POST /v1/speech-to-text</span>
+              </span>
+              <input
+                type="password"
+                value={draft.elevenLabsApiKey}
+                onChange={(e) => setDraft({ ...draft, elevenLabsApiKey: e.target.value })}
+                placeholder="xi-api-key (Leave blank or use fallback mode if ElevenLabs Free Tier blocks VPN)"
+                className="mt-1.5 w-full px-3.5 py-2 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-sm text-white font-mono focus:outline-none focus:border-[#D4AF37]"
+              />
+            </label>
+
+            {/* TTS Engine Mode & 401 Unusual Activity Protection */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <label className="block">
+                <span className="text-xs text-slate-300 font-medium flex items-center gap-1.5">
+                  <Volume2 className="w-3.5 h-3.5 text-[#D4AF37]" />
+                  Speech Synthesis Mode (401 Protection)
+                </span>
+                <select
+                  value={draft.ttsEngineMode || 'elevenlabs_with_fallback'}
+                  onChange={(e) =>
+                    setDraft({ ...draft, ttsEngineMode: e.target.value as TtsEngineMode })
+                  }
+                  className="mt-1 w-full px-3 py-2 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                >
+                  <option value="elevenlabs_with_fallback">
+                    ElevenLabs TTS + Auto-Fallback on 401 Block (Recommended)
+                  </option>
+                  <option value="local_acoustic_synth">
+                    Built-in Browser Acoustic Synthesizer Only (Zero Quota / Offline)
+                  </option>
+                  <option value="elevenlabs_strict">
+                    ElevenLabs Strict Only (Stop on 401 / Quota Error)
+                  </option>
+                </select>
+              </label>
+
+              <label className="block">
+                <span className="text-xs text-slate-400">ElevenLabs TTS Synthesis Model</span>
+                <select
+                  value={draft.elevenLabsTtsModel}
+                  onChange={(e) => setDraft({ ...draft, elevenLabsTtsModel: e.target.value })}
+                  className="mt-1 w-full px-3 py-2 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                >
+                  <option value="eleven_multilingual_v2">eleven_multilingual_v2 (Recommended)</option>
+                  <option value="eleven_flash_v2_5">eleven_flash_v2_5 (Low Latency)</option>
+                  <option value="eleven_turbo_v2_5">eleven_turbo_v2_5</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="space-y-2 pt-1">
+              <label className="flex items-center gap-2.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={draft.enableScribeFallbackToGemini ?? true}
+                  onChange={(e) =>
+                    setDraft({ ...draft, enableScribeFallbackToGemini: e.target.checked })
+                  }
+                  className="rounded border-slate-600 bg-[#0B0C10] text-[#D4AF37] focus:ring-[#D4AF37]"
+                />
+                <span className="text-xs text-slate-200 font-medium">
+                  Auto-fallback to Gemini 2.5 Flash Khmer/English Audio Transcription if ElevenLabs Scribe fails or returns 401
+                </span>
+              </label>
+
+              <label className="flex items-center gap-2.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={draft.persistLocally}
+                  onChange={(e) => setDraft({ ...draft, persistLocally: e.target.checked })}
+                  className="rounded border-slate-600 bg-[#0B0C10] text-[#D4AF37] focus:ring-[#D4AF37]"
+                />
+                <span className="text-xs text-slate-400">
+                  Persist configuration in browser localStorage (unchecked = session-only)
+                </span>
+              </label>
+            </div>
+          </div>
+
+          {/* Optional Whisper Verification Adapter */}
+          <div className="space-y-3 border-t border-[#262B3D] pt-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                <Globe className="w-4 h-4 text-sky-400" />
+                2. Optional Whisper Transcription Verification Adapter
+              </span>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={draft.enableWhisperVerification}
+                  onChange={(e) => setDraft({ ...draft, enableWhisperVerification: e.target.checked })}
+                  className="rounded border-slate-600 bg-[#0B0C10] text-sky-400"
+                />
+                <span className="text-xs text-sky-300 font-medium">Enable 2nd-Pass Verification</span>
+              </label>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="block">
+                <span className="text-xs text-slate-400">Whisper-Compatible Endpoint URL</span>
+                <input
+                  type="text"
+                  value={draft.whisperEndpointUrl}
+                  onChange={(e) => setDraft({ ...draft, whisperEndpointUrl: e.target.value })}
+                  placeholder="https://api.openai.com/v1/audio/transcriptions"
+                  className="mt-1 w-full px-3 py-2 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                />
+              </label>
+              <label className="block">
+                <span className="text-xs text-slate-400">Whisper API Key (Optional)</span>
+                <input
+                  type="password"
+                  value={draft.whisperApiKey}
+                  onChange={(e) => setDraft({ ...draft, whisperApiKey: e.target.value })}
+                  placeholder="sk-..."
+                  className="mt-1 w-full px-3 py-2 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-xs text-white font-mono focus:outline-none focus:border-sky-400"
+                />
+              </label>
+            </div>
+          </div>
+
+          {/* Optional Mode B Lip-Sync Service */}
+          <div className="space-y-2 border-t border-[#262B3D] pt-4">
+            <label className="block">
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                3. Optional Visual Lip-Sync Service Endpoint (Mode B)
+              </span>
+              <input
+                type="text"
+                value={draft.lipSyncEndpointUrl}
+                onChange={(e) => setDraft({ ...draft, lipSyncEndpointUrl: e.target.value })}
+                placeholder="Leave blank if no external visual lip-sync GPU worker is connected (Mode A remains active)"
+                className="mt-1.5 w-full px-3.5 py-2 rounded-lg bg-[#0B0C10] border border-[#262B3D] text-xs text-white font-mono focus:outline-none focus:border-[#D4AF37]"
+              />
+            </label>
+          </div>
+
+          <div className="p-3.5 rounded-lg bg-amber-500/10 border border-amber-500/30 flex gap-3 text-xs text-amber-200/90 leading-relaxed">
+            <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold text-amber-300 block mb-0.5">
+                Troubleshooting ElevenLabs 401 &quot;detected_unusual_activity&quot;
+              </span>
+              ElevenLabs blocks Free Tier API keys when requests originate from a VPN, proxy, or shared cloud IP. With <strong>Auto-Fallback</strong> enabled above, AngkorDub AI automatically switches to Gemini 2.5 Flash for Khmer/English transcription and the Built-in Browser Acoustic Synthesizer for duration-measured audio so your dubbing pipeline never stalls.
+            </div>
+          </div>
+
+          <div className="flex items-center justify-end gap-3 pt-4 border-t border-[#262B3D]">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 rounded-lg text-xs font-medium text-slate-300 hover:bg-white/5"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="px-5 py-2 rounded-lg text-xs font-semibold bg-[#D4AF37] text-[#0B0C10] hover:bg-[#e3be42] transition-colors"
+            >
+              Save Engine Configuration
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};

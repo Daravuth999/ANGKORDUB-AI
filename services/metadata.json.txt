@@ -1,0 +1,4 @@
+{
+  "name": "AngkorDub AI — Movie Dubbing Production Station",
+  "description": "Scribe-first movie dubbing production station with natural Cambodian Khmer localization via Gemini, persistent ElevenLabs Voice Lock Vault, duration-aware timing correction, optional Whisper verification, and browser-based video muxing."
+}

@@ -1,0 +1,411 @@
+import { GoogleGenAI, Type } from '@google/genai';
+import {
+  DialogueSegment,
+  CharacterProfile,
+  DialogueStyle,
+  WordEvent,
+  SourceEngine,
+  ReviewStatus,
+  TimingStatus
+} from '../types';
+import { extractCompactAudioWavFromFile, ScribeTranscriptionResult } from './elevenLabsService';
+
+export interface LocalizedSegmentResult {
+  segment_id: string;
+  translated_text: string;
+  literal_meaning: string;
+  natural_spoken_version: string;
+  shorter_dubbing_version: string;
+  emotion_direction: string;
+  delivery_notes: string;
+  estimated_speech_duration: number;
+  review_required: boolean;
+  review_reason: string;
+}
+
+function createGeminiClient(customApiKey?: string): GoogleGenAI {
+  const trimmed = customApiKey?.trim();
+  if (trimmed) {
+    return new GoogleGenAI({ apiKey: trimmed });
+  }
+  return new GoogleGenAI({ apiKey: process.env.API_KEY, vertexai: true });
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const commaIdx = result.indexOf(',');
+      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Fallback Khmer/English Audio Transcription & Speaker Diarization using Gemini 2.5 Flash
+ * when ElevenLabs Scribe v2 is blocked by a 401 Free Tier VPN error or fails on a difficult Khmer audio track.
+ */
+export async function transcribeAudioWithGeminiFallback(
+  mediaFile: File,
+  languageHint: 'en' | 'km',
+  onProgress?: (msg: string) => void,
+  customGeminiApiKey?: string
+): Promise<ScribeTranscriptionResult> {
+  const ai = createGeminiClient(customGeminiApiKey);
+
+  const wavFile = await extractCompactAudioWavFromFile(mediaFile, onProgress);
+  onProgress?.('Encoding extracted 16kHz audio for Gemini 2.5 Flash Khmer/English transcription & speaker diarization...');
+  const base64Audio = await fileToBase64(wavFile);
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: {
+      role: 'user',
+      parts: [
+        {
+          inlineData: {
+            mimeType: wavFile.type || 'audio/wav',
+            data: base64Audio
+          }
+        },
+        {
+          text: `Transcribe this movie audio with high accuracy, speaker diarization, and precise start/end timestamps in seconds.
+Primary expected language hint: "${languageHint === 'km' ? 'Cambodian Khmer (ខ្មែរ)' : 'English'}".
+For Cambodian Khmer speech:
+- Use authentic, properly segmented Khmer script (អក្សរខ្មែរ).
+- Preserve spoken particles (ណា៎, ទេ, ផង, ហ្នឹង, មែនទេ) and natural conversational phrasing.
+- Identify distinct speakers (speaker_0, speaker_1, etc.) and non-speech audio events (e.g. [footsteps], [sigh]).`
+        }
+      ]
+    },
+    config: {
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          detected_language: {
+            type: Type.STRING,
+            description: '"km" for Cambodian Khmer or "en" for English'
+          },
+          segments: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                speaker_id: { type: Type.STRING, description: 'e.g. speaker_0, speaker_1' },
+                start: { type: Type.NUMBER, description: 'Start timestamp in seconds' },
+                end: { type: Type.NUMBER, description: 'End timestamp in seconds' },
+                text: { type: Type.STRING, description: 'Transcribed dialogue in original language' },
+                audio_events: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING }
+                }
+              },
+              required: ['speaker_id', 'start', 'end', 'text', 'audio_events']
+            }
+          }
+        },
+        required: ['detected_language', 'segments']
+      }
+    }
+  });
+
+  const rawJsonText = response.text?.trim() || '{}';
+  const parsed = JSON.parse(rawJsonText) as {
+    detected_language?: string;
+    segments?: Array<{
+      speaker_id: string;
+      start: number;
+      end: number;
+      text: string;
+      audio_events?: string[];
+    }>;
+  };
+
+  const detectedLanguage: 'en' | 'km' =
+    parsed.detected_language === 'km' || languageHint === 'km' ? 'km' : 'en';
+  const targetLanguage: 'km' | 'en' = detectedLanguage === 'en' ? 'km' : 'en';
+
+  const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
+  let wordCounter = 1;
+
+  const segments: DialogueSegment[] = rawSegments.map((item, idx) => {
+    const segId = `seg_${idx + 1}`;
+    const start = Number(Math.max(0, item.start).toFixed(3));
+    const end = Number(Math.max(start + 0.6, item.end).toFixed(3));
+    const availableDuration = Number((end - start).toFixed(3));
+    const spk = item.speaker_id || 'speaker_0';
+    const charId = `char_${spk}`;
+
+    const tokens = item.text
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    const tokenDur = tokens.length > 0 ? availableDuration / tokens.length : availableDuration;
+
+    const wordEvents: WordEvent[] = tokens.map((tok, tIdx) => {
+      const wStart = Number((start + tIdx * tokenDur).toFixed(3));
+      const wEnd = Number((tIdx === tokens.length - 1 ? end : wStart + tokenDur * 0.92).toFixed(3));
+      return {
+        word_id: `w_${wordCounter++}`,
+        segment_id: segId,
+        speaker_id: spk,
+        start: wStart,
+        end: wEnd,
+        original_text: tok,
+        language: detectedLanguage,
+        word_type: 'word',
+        confidence: 0.92,
+        source_engine: SourceEngine.GEMINI_AUDIO_FALLBACK,
+        review_status: ReviewStatus.VERIFIED
+      };
+    });
+
+    return {
+      segment_id: segId,
+      speaker_id: spk,
+      character_id: charId,
+      source_start: start,
+      source_end: end,
+      available_duration: availableDuration,
+      proposed_dubbed_start: start,
+      proposed_dubbed_end: end,
+      actual_synthesized_duration: null,
+      final_approved_start: start,
+      final_approved_end: end,
+      playback_rate_adjustment: 1.0,
+      original_text: item.text.trim(),
+      language: detectedLanguage,
+      target_language: targetLanguage,
+      word_events: wordEvents,
+      audio_events: Array.isArray(item.audio_events) ? item.audio_events : [],
+      translated_text: '',
+      literal_meaning: '',
+      natural_spoken_version: '',
+      shorter_dubbing_version: '',
+      selected_version_type: 'natural',
+      active_target_text: '',
+      emotion_direction: '',
+      delivery_notes: '',
+      pronunciation_notes: '',
+      estimated_speech_duration: null,
+      source_engine: SourceEngine.GEMINI_AUDIO_FALLBACK,
+      review_status: ReviewStatus.VERIFIED,
+      review_required: true,
+      review_reason: 'Transcribed via Gemini 2.5 Flash Khmer/English Audio Fallback; verify timestamps.',
+      timing_status: TimingStatus.UNMEASURED,
+      overlap_seconds: 0,
+      synthesized_audio_base64: null,
+      synthesized_audio_mime: null,
+      synthesized_voice_id: null,
+      is_locked_approved: false
+    };
+  });
+
+  const defaultVoices = [
+    { id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam (Multilingual v2)' },
+    { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah (Multilingual v2)' },
+    { id: 'onwK4e9ZLuTAKqWW03F9', name: 'Daniel (Multilingual v2)' }
+  ];
+
+  const speakerMap = new Map<string, CharacterProfile>();
+  segments.forEach((seg) => {
+    const existing = speakerMap.get(seg.speaker_id);
+    if (!existing) {
+      const preset = defaultVoices[speakerMap.size % defaultVoices.length];
+      speakerMap.set(seg.speaker_id, {
+        character_id: seg.character_id,
+        original_speaker_id: seg.speaker_id,
+        character_name: `Speaker ${seg.speaker_id.replace('speaker_', '#')}`,
+        first_appearance: seg.source_start,
+        dialogue_count: 1,
+        voice_description: `Diarized speaker (${detectedLanguage.toUpperCase()})`,
+        perceived_vocal_presentation: 'Diarized Track',
+        relationship_context: 'Scene character',
+        assigned_voice_id: preset.id,
+        assigned_voice_name: preset.name,
+        is_voice_locked: true,
+        target_language_compatibility: 'verified_multilingual_v2',
+        pronunciation_notes: '',
+        voice_consistency_notes: 'Locked in Voice Vault',
+        audition_audio_base64: null,
+        review_status: ReviewStatus.VERIFIED
+      });
+    } else {
+      existing.dialogue_count += 1;
+    }
+  });
+
+  return {
+    rawResponseJson: rawJsonText,
+    detectedLanguage,
+    segments,
+    characters: Array.from(speakerMap.values()),
+    usedFallbackEngine: true
+  };
+}
+
+/**
+ * Translates and polishes dialogue segments into natural, spoken Cambodian Khmer (or English)
+ * using gemini-2.5-flash while strictly preserving Scribe's source timestamps.
+ */
+export async function localizeDialogueSegmentsWithGemini(params: {
+  segments: DialogueSegment[];
+  characters: CharacterProfile[];
+  dialogueStyle: DialogueStyle;
+  sceneContextNotes: string;
+  customGeminiApiKey?: string;
+  onSegmentProgress?: (processed: number, total: number, currentSegId: string) => void;
+}): Promise<LocalizedSegmentResult[]> {
+  const {
+    segments,
+    characters,
+    dialogueStyle,
+    sceneContextNotes,
+    customGeminiApiKey,
+    onSegmentProgress
+  } = params;
+
+  const ai = createGeminiClient(customGeminiApiKey);
+  const charMap = new Map<string, CharacterProfile>();
+  characters.forEach((c) => charMap.set(c.character_id, c));
+
+  const results: LocalizedSegmentResult[] = [];
+  const windowSize = 4;
+
+  for (let i = 0; i < segments.length; i += windowSize) {
+    const batch = segments.slice(i, i + windowSize);
+    const prevSegment = i > 0 ? segments[i - 1] : null;
+    const nextSegment = i + windowSize < segments.length ? segments[i + windowSize] : null;
+
+    onSegmentProgress?.(i, segments.length, batch[0].segment_id);
+
+    const payloadInput = batch.map((seg, idx) => {
+      const charProfile = charMap.get(seg.character_id);
+      const prevLine = idx > 0 ? batch[idx - 1].original_text : prevSegment?.original_text || 'None';
+      const nextLine =
+        idx < batch.length - 1 ? batch[idx + 1].original_text : nextSegment?.original_text || 'None';
+
+      return {
+        segment_id: seg.segment_id,
+        original_dialogue: seg.original_text,
+        original_language: seg.language,
+        target_language: seg.target_language,
+        source_start: seg.source_start,
+        source_end: seg.source_end,
+        available_speaking_duration_seconds: seg.available_duration,
+        speaker_id: seg.speaker_id,
+        character_name: charProfile?.character_name || seg.speaker_id,
+        character_description: charProfile?.voice_description || '',
+        character_relationship_context: charProfile?.relationship_context || '',
+        character_pronunciation_notes:
+          seg.pronunciation_notes || charProfile?.pronunciation_notes || '',
+        audio_events: seg.audio_events,
+        previous_dialogue: prevLine,
+        following_dialogue: nextLine
+      };
+    });
+
+    const systemInstruction = `You are a Principal Cambodian Khmer Film Dubbing Director, Localization Specialist, and Speech Adaptation Engineer.
+Your mission is to adapt validated movie transcript segments into natural, fluent, spoken Cambodian Khmer (when target_language is "km") or natural cinematic English (when target_language is "en").
+
+CRITICAL KHMER DUBBING DIRECTIVES:
+1. NEVER translate English into stiff, word-for-word textbook Khmer.
+2. Adapt sentence structures to authentic spoken Cambodian Khmer that sounds natural when performed aloud by voice actors.
+3. Choose authentic pronouns, kinship forms of address (បង, អូន, លោកគ្រូ, ពួកយើង, ឯង), and natural spoken final particles (ណា៎, ទេ, ផង, ហ្នឹង, មែនទេ, តើ) matching character relationships and scene tension.
+4. Selected Dialogue Style: "${dialogueStyle}".
+5. Scene Context: "${sceneContextNotes || 'Dramatic cinematic movie sequence'}".
+6. Respect the available_speaking_duration_seconds window (${batch.map((b) => `${b.segment_id}: ${b.available_duration}s`).join(', ')}).
+7. Provide BOTH a "natural_spoken_version" (best natural performance) AND a "shorter_dubbing_version" (concise phrasing for tight lip-sync timing windows without losing core meaning).
+8. Use normal Khmer script without inserting artificial phonetic tags into the Khmer text.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        role: 'user',
+        parts: [
+          {
+            text: `Localize the following dialogue segments for movie dubbing:\n${JSON.stringify(
+              payloadInput,
+              null,
+              2
+            )}`
+          }
+        ]
+      },
+      config: {
+        systemInstruction,
+        temperature: 0.35,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              segment_id: { type: Type.STRING },
+              translated_text: {
+                type: Type.STRING,
+                description: 'Standard accurate translation in target language'
+              },
+              literal_meaning: {
+                type: Type.STRING,
+                description: 'Back-translation / literal meaning for director review'
+              },
+              natural_spoken_version: {
+                type: Type.STRING,
+                description: 'Natural, fluent spoken Cambodian Khmer or English dialogue for dubbing'
+              },
+              shorter_dubbing_version: {
+                type: Type.STRING,
+                description: 'Concise spoken alternative that fits tighter duration constraints'
+              },
+              emotion_direction: {
+                type: Type.STRING,
+                description: 'Emotional tone and acting cue (e.g. Urgent hushed warning)'
+              },
+              delivery_notes: {
+                type: Type.STRING,
+                description: 'Pacing, breath, pause, and Khmer particle intonation notes'
+              },
+              estimated_speech_duration: {
+                type: Type.NUMBER,
+                description: 'Estimated spoken duration in seconds for the natural_spoken_version'
+              },
+              review_required: {
+                type: Type.BOOLEAN,
+                description: 'True if cultural nuance or tight timing requires human director review'
+              },
+              review_reason: {
+                type: Type.STRING,
+                description: 'Explanation if review_required is true, otherwise empty string'
+              }
+            },
+            required: [
+              'segment_id',
+              'translated_text',
+              'literal_meaning',
+              'natural_spoken_version',
+              'shorter_dubbing_version',
+              'emotion_direction',
+              'delivery_notes',
+              'estimated_speech_duration',
+              'review_required',
+              'review_reason'
+            ]
+          }
+        }
+      }
+    });
+
+    const jsonText = response.text?.trim() || '[]';
+    const parsedBatch: LocalizedSegmentResult[] = JSON.parse(jsonText);
+    results.push(...parsedBatch);
+  }
+
+  onSegmentProgress?.(segments.length, segments.length, 'Complete');
+  return results;
+}

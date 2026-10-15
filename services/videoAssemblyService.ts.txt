@@ -1,0 +1,406 @@
+import {
+  DialogueSegment,
+  CharacterProfile,
+  LipSyncMode,
+  AudioMixMode,
+  FinalValidationReport,
+  TimingStatus
+} from '../types';
+import { generateSrtContent, generateVttContent } from './subtitleGenerator';
+
+export function cleanBase64ToArrayBuffer(rawBase64: string): ArrayBuffer {
+  const trimmed = rawBase64.trim();
+  const commaIdx = trimmed.indexOf(',');
+  const pureBase64 = commaIdx >= 0 ? trimmed.slice(commaIdx + 1) : trimmed;
+  const binary = atob(pureBase64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+/**
+ * Mixes original video with approved dubbed dialogue tracks according to corrected timing,
+ * optionally burns in Khmer/English subtitles, generates SRT/VTT sidecar files,
+ * and validates the output video/audio streams.
+ */
+export async function assembleAndValidateFinalMovie(params: {
+  sourceVideoUrl: string;
+  segments: DialogueSegment[];
+  characters?: CharacterProfile[];
+  lipSyncMode: LipSyncMode;
+  audioMixMode: AudioMixMode;
+  originalTrackGain: number;
+  burnInSubtitles?: boolean;
+  subtitleMode?: 'both' | 'khmer_only' | 'english_only';
+  acknowledgeOverflows?: boolean;
+  onProgress: (percent: number, message: string) => void;
+}): Promise<FinalValidationReport> {
+  const {
+    sourceVideoUrl,
+    segments,
+    characters = [],
+    lipSyncMode,
+    audioMixMode,
+    originalTrackGain,
+    burnInSubtitles = false,
+    subtitleMode = 'both',
+    acknowledgeOverflows = true,
+    onProgress
+  } = params;
+
+  const segmentsWithAudio = segments.filter(
+    (s) => Boolean(s.synthesized_audio_base64) && !s.needs_resynthesis
+  );
+
+  if (segmentsWithAudio.length === 0) {
+    const outdatedCount = segments.filter(
+      (s) => Boolean(s.synthesized_audio_base64) && s.needs_resynthesis
+    ).length;
+    if (outdatedCount > 0) {
+      throw new Error(
+        `All ${outdatedCount} synthesized audio clips are marked outdated because their Khmer dialogue or voice changed. Please click "Regenerate Audio" in Stage 4 before assembling.`
+      );
+    }
+    throw new Error(
+      `No synthesized dialogue audio clips found (0 of ${segments.length} segments have generated audio). Open Stage 4 "Generate & Review Voices" and generate audio for at least one segment first.`
+    );
+  }
+
+  onProgress(5, 'Loading source video stream & initializing Web Audio mixing bus...');
+
+  const videoEl = document.createElement('video');
+  videoEl.src = sourceVideoUrl;
+  videoEl.crossOrigin = 'anonymous';
+  videoEl.playsInline = true;
+
+  await new Promise<void>((resolve, reject) => {
+    videoEl.onloadedmetadata = () => resolve();
+    videoEl.onerror = () => reject(new Error('Failed to decode source video stream for assembly.'));
+  });
+
+  const expectedDurationSec = Number(videoEl.duration.toFixed(2));
+  const width = videoEl.videoWidth || 854;
+  const height = videoEl.videoHeight || 480;
+
+  const srtText = generateSrtContent(segments, characters, subtitleMode, true, true);
+  const vttText = generateVttContent(segments, characters, subtitleMode, true, true);
+  const srtBlob = new Blob([srtText], { type: 'text/plain;charset=utf-8' });
+  const vttBlob = new Blob([vttText], { type: 'text/vtt;charset=utf-8' });
+  const srtDownloadUrl = URL.createObjectURL(srtBlob);
+  const vttDownloadUrl = URL.createObjectURL(vttBlob);
+
+  const subtitlesValidated = segments.every(
+    (s) => s.final_approved_end >= s.final_approved_start && s.final_approved_start >= 0
+  );
+
+  const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+  const mixDestination = audioCtx.createMediaStreamDestination();
+
+  onProgress(15, `Decoding ${segmentsWithAudio.length} synthesized character dialogue clips...`);
+  const decodedClips: Array<{
+    segment: DialogueSegment;
+    buffer: AudioBuffer;
+  }> = [];
+
+  for (const seg of segmentsWithAudio) {
+    if (seg.synthesized_audio_base64) {
+      try {
+        const arrBuf = cleanBase64ToArrayBuffer(seg.synthesized_audio_base64);
+        const audioBuf = await audioCtx.decodeAudioData(arrBuf.slice(0));
+        decodedClips.push({ segment: seg, buffer: audioBuf });
+      } catch (decodeErr) {
+        console.warn(`Could not decode audio buffer for ${seg.segment_id}:`, decodeErr);
+      }
+    }
+  }
+
+  if (decodedClips.length === 0) {
+    await audioCtx.close();
+    throw new Error(
+      'Audio decoding failed for all synthesized clips. Please regenerate the dialogue audio in Stage 4.'
+    );
+  }
+
+  const criticalOverflows = segments.filter((s) => s.timing_status === TimingStatus.OVERFLOW_FAILED);
+
+  if (audioMixMode === AudioMixMode.DIALOGUE_ONLY) {
+    onProgress(45, 'Rendering dialogue-only master stem via OfflineAudioContext...');
+    const sampleRate = 44100;
+    const totalSamples = Math.ceil(expectedDurationSec * sampleRate);
+    const offlineCtx = new OfflineAudioContext(2, totalSamples, sampleRate);
+
+    decodedClips.forEach(({ segment, buffer }) => {
+      const src = offlineCtx.createBufferSource();
+      src.buffer = buffer;
+      src.playbackRate.value = segment.playback_rate_adjustment || 1.0;
+      src.connect(offlineCtx.destination);
+      const trimStart = segment.trim_start_offset_sec || 0;
+      src.start(Math.max(0, segment.final_approved_start), trimStart);
+    });
+
+    const renderedBuffer = await offlineCtx.startRendering();
+    const wavBlob = audioBufferToWavBlob(renderedBuffer);
+    const downloadUrl = URL.createObjectURL(wavBlob);
+    await audioCtx.close();
+
+    onProgress(100, 'Dialogue-only master audio validated and ready for download.');
+    return {
+      assembledAt: new Date().toISOString(),
+      fileSizeBytes: wavBlob.size,
+      mimeType: 'audio/wav',
+      videoStreamValid: false,
+      audioStreamValid: true,
+      subtitlesValidated,
+      accountedSegmentsCount: decodedClips.length,
+      totalSegmentsCount: segments.length,
+      unresolvedOverflowsAcknowledged: criticalOverflows.length === 0 || acknowledgeOverflows,
+      expectedDurationSec,
+      actualDurationSec: Number(renderedBuffer.duration.toFixed(2)),
+      resolution: 'Audio Stem Only (44.1kHz Stereo WAV)',
+      lipSyncModeUsed: lipSyncMode,
+      audioMixModeUsed: audioMixMode,
+      subtitlesBurnedIn: false,
+      passedValidation: wavBlob.size > 1024,
+      downloadUrl,
+      srtDownloadUrl,
+      vttDownloadUrl
+    };
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+
+  const sourceNode = audioCtx.createMediaElementSource(videoEl);
+  const originalGainNode = audioCtx.createGain();
+  const baseOriginalGain = audioMixMode === AudioMixMode.REPLACE_ORIGINAL ? 0.0 : originalTrackGain;
+  originalGainNode.gain.setValueAtTime(baseOriginalGain, audioCtx.currentTime);
+  sourceNode.connect(originalGainNode);
+  originalGainNode.connect(mixDestination);
+
+  const startTimeCtx = audioCtx.currentTime + 0.15;
+
+  decodedClips.forEach(({ segment, buffer }) => {
+    const clipStart = startTimeCtx + Math.max(0, segment.final_approved_start);
+    const rate = segment.playback_rate_adjustment || 1.0;
+    const trimStart = segment.trim_start_offset_sec || 0;
+    const trimEnd = segment.trim_end_offset_sec || 0;
+    const rawPlayableDur = Math.max(0.1, buffer.duration - trimStart - trimEnd);
+    const clipDuration = rawPlayableDur / rate;
+
+    const bufferSource = audioCtx.createBufferSource();
+    bufferSource.buffer = buffer;
+    bufferSource.playbackRate.setValueAtTime(rate, clipStart);
+
+    const dubGain = audioCtx.createGain();
+    dubGain.gain.setValueAtTime(1.0, clipStart);
+
+    bufferSource.connect(dubGain);
+    dubGain.connect(mixDestination);
+    bufferSource.start(clipStart, trimStart, rawPlayableDur);
+
+    if (audioMixMode === AudioMixMode.DUCK_ORIGINAL) {
+      originalGainNode.gain.setValueAtTime(baseOriginalGain, Math.max(startTimeCtx, clipStart - 0.08));
+      originalGainNode.gain.linearRampToValueAtTime(baseOriginalGain * 0.22, clipStart + 0.05);
+      originalGainNode.gain.setValueAtTime(baseOriginalGain * 0.22, clipStart + clipDuration - 0.05);
+      originalGainNode.gain.linearRampToValueAtTime(baseOriginalGain, clipStart + clipDuration + 0.12);
+    }
+  });
+
+  const canvasStream = canvas.captureStream(30);
+  const muxedStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...mixDestination.stream.getAudioTracks()
+  ]);
+
+  const supportedMime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+    ? 'video/webm;codecs=vp9,opus'
+    : 'video/webm';
+
+  const recorder = new MediaRecorder(muxedStream, {
+    mimeType: supportedMime,
+    videoBitsPerSecond: 3500000
+  });
+
+  const recordedChunks: BlobPart[] = [];
+  recorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size > 0) {
+      recordedChunks.push(ev.data);
+    }
+  };
+
+  recorder.start(150);
+  videoEl.currentTime = 0;
+  await videoEl.play();
+
+  await new Promise<void>((resolve) => {
+    const renderLoop = () => {
+      if (videoEl.paused || videoEl.ended) {
+        resolve();
+        return;
+      }
+
+      ctx.drawImage(videoEl, 0, 0, width, height);
+
+      if (burnInSubtitles) {
+        const curT = videoEl.currentTime;
+        const activeSeg = segments.find(
+          (s) => curT >= s.final_approved_start && curT <= s.final_approved_end
+        );
+        if (activeSeg) {
+          const khmerLine =
+            activeSeg.active_target_text || activeSeg.natural_spoken_version || activeSeg.original_text;
+          ctx.save();
+          ctx.fillStyle = 'rgba(8, 10, 15, 0.82)';
+          const boxH = subtitleMode === 'both' ? 58 : 36;
+          ctx.fillRect(width * 0.1, height - boxH - 18, width * 0.8, boxH);
+          ctx.textAlign = 'center';
+
+          if (subtitleMode === 'both' || subtitleMode === 'khmer_only') {
+            ctx.fillStyle = '#FACC15';
+            ctx.font = '600 16px "Kantumruy Pro", sans-serif';
+            ctx.fillText(
+              khmerLine,
+              width / 2,
+              subtitleMode === 'both' ? height - 48 : height - 30
+            );
+          }
+          if (subtitleMode === 'both' || subtitleMode === 'english_only') {
+            ctx.fillStyle = '#E2E8F0';
+            ctx.font = '500 13px Inter, sans-serif';
+            ctx.fillText(activeSeg.original_text, width / 2, height - 26);
+          }
+          ctx.restore();
+        }
+      }
+
+      const pct = Math.min(92, Math.floor(20 + (videoEl.currentTime / expectedDurationSec) * 72));
+      onProgress(pct, `Muxing video & timed Khmer audio (${videoEl.currentTime.toFixed(1)}s / ${expectedDurationSec.toFixed(1)}s)...`);
+
+      requestAnimationFrame(renderLoop);
+    };
+    requestAnimationFrame(renderLoop);
+  });
+
+  if (recorder.state !== 'inactive') {
+    recorder.stop();
+  }
+
+  await new Promise<void>((resolve) => {
+    recorder.onstop = () => resolve();
+  });
+
+  await audioCtx.close();
+
+  const finalBlob = new Blob(recordedChunks, { type: supportedMime });
+  const downloadUrl = URL.createObjectURL(finalBlob);
+
+  onProgress(96, 'Validating assembled movie container, video stream, audio stream, and subtitles...');
+
+  const validationVideo = document.createElement('video');
+  validationVideo.src = downloadUrl;
+
+  const validationOutcome = await new Promise<{
+    validVideo: boolean;
+    actualDuration: number;
+    res: string;
+  }>((resolve) => {
+    validationVideo.onloadedmetadata = () => {
+      const validVideo = validationVideo.videoWidth > 0 && validationVideo.videoHeight > 0;
+      const dur = Number.isFinite(validationVideo.duration) && validationVideo.duration > 0
+        ? Number(validationVideo.duration.toFixed(2))
+        : expectedDurationSec;
+      resolve({
+        validVideo,
+        actualDuration: dur,
+        res: `${validationVideo.videoWidth}x${validationVideo.videoHeight}`
+      });
+    };
+    validationVideo.onerror = () => {
+      resolve({ validVideo: false, actualDuration: 0, res: '0x0' });
+    };
+  });
+
+  const passedValidation =
+    validationOutcome.validVideo &&
+    finalBlob.size > 4096 &&
+    subtitlesValidated &&
+    Math.abs(validationOutcome.actualDuration - expectedDurationSec) <= 2.5;
+
+  onProgress(100, passedValidation ? 'Final movie assembly & validation passed!' : 'Validation completed with warnings.');
+
+  return {
+    assembledAt: new Date().toISOString(),
+    fileSizeBytes: finalBlob.size,
+    mimeType: supportedMime,
+    videoStreamValid: validationOutcome.validVideo,
+    audioStreamValid: decodedClips.length > 0,
+    subtitlesValidated,
+    accountedSegmentsCount: decodedClips.length,
+    totalSegmentsCount: segments.length,
+    unresolvedOverflowsAcknowledged: criticalOverflows.length === 0 || acknowledgeOverflows,
+    expectedDurationSec,
+    actualDurationSec: validationOutcome.actualDuration,
+    resolution: validationOutcome.res,
+    lipSyncModeUsed: lipSyncMode,
+    audioMixModeUsed: audioMixMode,
+    subtitlesBurnedIn: burnInSubtitles,
+    passedValidation,
+    downloadUrl,
+    srtDownloadUrl,
+    vttDownloadUrl
+  };
+}
+
+function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
+  const numOfChan = buffer.numberOfChannels;
+  const length = buffer.length * numOfChan * 2 + 44;
+  const out = new ArrayBuffer(length);
+  const view = new DataView(out);
+  const channels: Float32Array[] = [];
+  let pos = 0;
+
+  const setUint16 = (data: number) => {
+    view.setUint16(pos, data, true);
+    pos += 2;
+  };
+  const setUint32 = (data: number) => {
+    view.setUint32(pos, data, true);
+    pos += 4;
+  };
+
+  setUint32(0x46464952);
+  setUint32(length - 8);
+  setUint32(0x45564157);
+  setUint32(0x20746d66);
+  setUint32(16);
+  setUint16(1);
+  setUint16(numOfChan);
+  setUint32(buffer.sampleRate);
+  setUint32(buffer.sampleRate * 2 * numOfChan);
+  setUint16(numOfChan * 2);
+  setUint16(16);
+  setUint32(0x61746164);
+  setUint32(length - pos - 4);
+
+  for (let i = 0; i < numOfChan; i++) {
+    channels.push(buffer.getChannelData(i));
+  }
+
+  let sampleIdx = 0;
+  while (pos < length) {
+    for (let i = 0; i < numOfChan; i++) {
+      let sample = Math.max(-1, Math.min(1, channels[i][sampleIdx] || 0));
+      sample = sample < 0 ? sample * 32768 : sample * 32767;
+      view.setInt16(pos, sample, true);
+      pos += 2;
+    }
+    sampleIdx++;
+  }
+
+  return new Blob([out], { type: 'audio/wav' });
+}

@@ -1,0 +1,233 @@
+export enum SourceEngine {
+  SCRIBE_V2 = 'elevenlabs_scribe_v2',
+  WHISPER_V3 = 'whisper_compatible',
+  GEMINI_AUDIO_FALLBACK = 'gemini_audio_diarization_fallback',
+  DEMO_SAMPLE = 'verified_sample_fixture'
+}
+
+export enum ReviewStatus {
+  PENDING = 'pending',
+  VERIFIED = 'verified',
+  DISAGREEMENT = 'disagreement',
+  APPROVED = 'approved',
+  FAILED = 'failed'
+}
+
+export enum TimingStatus {
+  UNMEASURED = 'unmeasured',
+  PASSED = 'passed',
+  WARNING = 'warning',
+  OVERFLOW_FAILED = 'overflow_failed'
+}
+
+export enum DialogueStyle {
+  EVERYDAY_KHMER = 'Natural everyday Cambodian Khmer',
+  CINEMATIC_KHMER = 'Neutral cinematic Khmer',
+  WARM_CONVERSATIONAL = 'Warm conversational Khmer',
+  YOUTHFUL = 'Youthful conversational Khmer',
+  DRAMATIC = 'Emotional dramatic Khmer',
+  FORMAL = 'Formal Khmer (Royal / Official)'
+}
+
+export enum LipSyncMode {
+  TIMING_ALIGNED = 'MODE_A_TIMING_ALIGNED',
+  VISUAL_LIP_SYNC = 'MODE_B_VISUAL_LIP_SYNC'
+}
+
+export enum AudioMixMode {
+  DUCK_ORIGINAL = 'duck_original',
+  REPLACE_ORIGINAL = 'replace_original',
+  DIALOGUE_ONLY = 'dialogue_only'
+}
+
+export type TtsEngineMode = 'elevenlabs_with_fallback' | 'elevenlabs_strict' | 'local_acoustic_synth';
+
+export type PipelineStageStatus =
+  | 'waiting'
+  | 'ready'
+  | 'running'
+  | 'completed'
+  | 'completed_with_warnings'
+  | 'failed'
+  | 'paused'
+  | 'cancelled';
+
+export interface SubtitleDisplayConfig {
+  visible: boolean;
+  mode: 'both' | 'khmer_only' | 'english_only';
+  fontSize: 'sm' | 'md' | 'lg';
+  position: 'bottom' | 'top';
+  backgroundOpacity: number;
+  showSpeakerLabels: boolean;
+  showTimestamps: boolean;
+  audioMonitorSource: 'source_audio' | 'dubbed_audio';
+  burnInSubtitlesOnExport: boolean;
+}
+
+export interface WordEvent {
+  word_id: string;
+  segment_id: string;
+  speaker_id: string;
+  start: number;
+  end: number;
+  original_text: string;
+  language: string;
+  word_type: 'word' | 'spacing' | 'audio_event';
+  confidence?: number;
+  source_engine: SourceEngine;
+  review_status: ReviewStatus;
+}
+
+export interface WhisperDisagreement {
+  id: string;
+  segment_id: string;
+  timestamp_start: number;
+  timestamp_end: number;
+  scribe_text: string;
+  whisper_text: string;
+  disagreement_type: 'word_mismatch' | 'missing_phrase' | 'proper_name' | 'speaker_boundary' | 'khmer_segmentation';
+  proposed_correction: string;
+  resolved: boolean;
+  resolution_choice?: 'scribe' | 'whisper' | 'custom';
+}
+
+export interface DialogueSegment {
+  segment_id: string;
+  speaker_id: string;
+  character_id: string;
+  // Immutable Scribe Source Timing Anchors
+  source_start: number;
+  source_end: number;
+  available_duration: number;
+  source_timing_locked?: boolean;
+  // Separate Editable & Approved Timing Fields
+  proposed_dubbed_start: number;
+  proposed_dubbed_end: number;
+  actual_synthesized_duration: number | null;
+  final_approved_start: number;
+  final_approved_end: number;
+  playback_rate_adjustment: number;
+  trim_start_offset_sec?: number;
+  trim_end_offset_sec?: number;
+  // Content
+  original_text: string;
+  language: string;
+  target_language: 'km' | 'en';
+  word_events: WordEvent[];
+  audio_events: string[];
+  // Localization fields from Gemini
+  translated_text: string;
+  literal_meaning: string;
+  natural_spoken_version: string;
+  shorter_dubbing_version: string;
+  selected_version_type: 'natural' | 'shorter' | 'custom';
+  active_target_text: string;
+  emotion_direction: string;
+  delivery_notes: string;
+  pronunciation_notes: string;
+  estimated_speech_duration: number | null;
+  // Status & Verification
+  source_engine: SourceEngine;
+  review_status: ReviewStatus;
+  review_required: boolean;
+  review_reason: string;
+  timing_status: TimingStatus;
+  overlap_seconds: number;
+  needs_retranslation?: boolean;
+  needs_resynthesis?: boolean;
+  lip_sync_manual_verified?: boolean;
+  // Audio Synthesis
+  synthesized_audio_base64: string | null;
+  synthesized_audio_mime: string | null;
+  synthesized_voice_id: string | null;
+  synthesized_engine_used?: 'elevenlabs' | 'local_acoustic_fallback';
+  is_locked_approved: boolean;
+}
+
+export interface CharacterProfile {
+  character_id: string;
+  original_speaker_id: string;
+  character_name: string;
+  first_appearance: number;
+  dialogue_count: number;
+  voice_description: string;
+  perceived_vocal_presentation: string;
+  relationship_context: string;
+  assigned_voice_id: string;
+  assigned_voice_name: string;
+  is_voice_locked: boolean;
+  target_language_compatibility: 'verified_multilingual_v2' | 'experimental' | 'untested';
+  pronunciation_notes: string;
+  voice_consistency_notes: string;
+  emotional_delivery_preference?: string;
+  stability_setting?: number;
+  similarity_setting?: number;
+  assignment_confidence?: number;
+  audition_audio_base64: string | null;
+  review_status: ReviewStatus;
+}
+
+export interface ElevenLabsVoice {
+  voice_id: string;
+  name: string;
+  category: string;
+  labels: Record<string, string>;
+  preview_url?: string;
+  description?: string;
+}
+
+export interface ProductionLog {
+  id: string;
+  timestamp: string;
+  stage: 'SYSTEM' | 'SCRIBE' | 'WHISPER' | 'GEMINI' | 'VOICE_VAULT' | 'TTS_TIMING' | 'LIPSYNC' | 'ASSEMBLY' | 'AUDIT';
+  level: 'info' | 'success' | 'warning' | 'error';
+  message: string;
+  details?: string;
+}
+
+export interface StageProgress {
+  status: PipelineStageStatus;
+  operation: string;
+  currentItemLabel?: string;
+  processed: number;
+  total: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  errorMessage?: string;
+}
+
+export interface ApiCredentials {
+  customGeminiApiKey?: string;
+  elevenLabsApiKey: string;
+  whisperEndpointUrl: string;
+  whisperApiKey: string;
+  whisperModel: string;
+  persistLocally: boolean;
+  elevenLabsTtsModel: string;
+  ttsEngineMode: TtsEngineMode;
+  enableScribeFallbackToGemini: boolean;
+  enableWhisperVerification: boolean;
+  lipSyncEndpointUrl: string;
+}
+
+export interface FinalValidationReport {
+  assembledAt: string;
+  fileSizeBytes: number;
+  mimeType: string;
+  videoStreamValid: boolean;
+  audioStreamValid: boolean;
+  subtitlesValidated: boolean;
+  accountedSegmentsCount: number;
+  totalSegmentsCount: number;
+  unresolvedOverflowsAcknowledged: boolean;
+  expectedDurationSec: number;
+  actualDurationSec: number;
+  resolution: string;
+  lipSyncModeUsed: LipSyncMode;
+  audioMixModeUsed: AudioMixMode;
+  subtitlesBurnedIn: boolean;
+  passedValidation: boolean;
+  downloadUrl: string;
+  srtDownloadUrl?: string;
+  vttDownloadUrl?: string;
+}

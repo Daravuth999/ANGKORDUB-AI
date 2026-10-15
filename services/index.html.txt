@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AngkorDub AI — Production Station V2</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Kantumruy+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+  <script type="importmap">{
+  "imports": {
+    "react": "https://www.gstatic.com/agent-platform/modules/v1/react@19.2.7.4d5517570685122f.js",
+    "react-dom": "https://www.gstatic.com/agent-platform/modules/v1/react-dom@19.2.7.65799deb8803db6e.js",
+    "react-dom/client": "https://www.gstatic.com/agent-platform/modules/v1/react-dom@19.2.7.65799deb8803db6e.js",
+    "@google/genai": "https://www.gstatic.com/agent-platform/modules/v1/@google/genai@2.22.0.636463b84c469119.js",
+    "lucide-react": "https://www.gstatic.com/agent-platform/modules/v1/lucide-react@0.577.0.2bae552a4f75f2ab.js",
+    "framer-motion": "https://www.gstatic.com/agent-platform/modules/v1/framer-motion@12.38.0.8fd5167dc50a97b3.js",
+    "zustand": "https://www.gstatic.com/agent-platform/modules/v1/zustand@5.0.14.eeda09991e23db6d.js",
+    "recharts": "https://www.gstatic.com/agent-platform/modules/v1/recharts@3.10.1.6c82ab2514c601f8.js"
+  }
+}</script>
+</head>
+<body class="bg-[#0B0C10] text-[#F1F5F9] antialiased selection:bg-[#D4AF37]/30 selection:text-[#F1F5F9] overflow-hidden">
+  <div id="root"></div>
+  <script type="module" src="./index.tsx"></script>
+</body>
+</html>

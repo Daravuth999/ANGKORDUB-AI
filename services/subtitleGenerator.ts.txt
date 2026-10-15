@@ -1,0 +1,80 @@
+import { DialogueSegment, CharacterProfile } from '../types';
+
+function formatSrtTimestamp(seconds: number): string {
+  const safe = Math.max(0, seconds);
+  const hrs = Math.floor(safe / 3600);
+  const mins = Math.floor((safe % 3600) / 60);
+  const secs = Math.floor(safe % 60);
+  const ms = Math.round((safe - Math.floor(safe)) * 1000);
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+function formatVttTimestamp(seconds: number): string {
+  return formatSrtTimestamp(seconds).replace(',', '.');
+}
+
+export function generateSrtContent(
+  segments: DialogueSegment[],
+  characters: CharacterProfile[],
+  mode: 'both' | 'khmer_only' | 'english_only',
+  useDubbedTiming: boolean,
+  includeSpeakerNames: boolean
+): string {
+  const charMap = new Map(characters.map((c) => [c.character_id, c.character_name]));
+
+  return segments
+    .map((seg, idx) => {
+      const start = useDubbedTiming ? seg.final_approved_start : seg.source_start;
+      const end = useDubbedTiming ? seg.final_approved_end : seg.source_end;
+      const speakerPrefix = includeSpeakerNames
+        ? `[${charMap.get(seg.character_id) || seg.speaker_id}] `
+        : '';
+
+      const targetLine = seg.active_target_text || seg.natural_spoken_version || seg.original_text;
+      let body = '';
+      if (mode === 'both') {
+        body = `${speakerPrefix}${targetLine}\n${seg.original_text}`;
+      } else if (mode === 'khmer_only') {
+        body = `${speakerPrefix}${targetLine}`;
+      } else {
+        body = `${speakerPrefix}${seg.original_text}`;
+      }
+
+      return `${idx + 1}\n${formatSrtTimestamp(start)} --> ${formatSrtTimestamp(Math.max(start + 0.25, end))}\n${body}\n`;
+    })
+    .join('\n');
+}
+
+export function generateVttContent(
+  segments: DialogueSegment[],
+  characters: CharacterProfile[],
+  mode: 'both' | 'khmer_only' | 'english_only',
+  useDubbedTiming: boolean,
+  includeSpeakerNames: boolean
+): string {
+  const charMap = new Map(characters.map((c) => [c.character_id, c.character_name]));
+
+  const cues = segments
+    .map((seg, idx) => {
+      const start = useDubbedTiming ? seg.final_approved_start : seg.source_start;
+      const end = useDubbedTiming ? seg.final_approved_end : seg.source_end;
+      const speakerPrefix = includeSpeakerNames
+        ? `[${charMap.get(seg.character_id) || seg.speaker_id}] `
+        : '';
+
+      const targetLine = seg.active_target_text || seg.natural_spoken_version || seg.original_text;
+      let body = '';
+      if (mode === 'both') {
+        body = `${speakerPrefix}${targetLine}\n${seg.original_text}`;
+      } else if (mode === 'khmer_only') {
+        body = `${speakerPrefix}${targetLine}`;
+      } else {
+        body = `${speakerPrefix}${seg.original_text}`;
+      }
+
+      return `${idx + 1}\n${formatVttTimestamp(start)} --> ${formatVttTimestamp(Math.max(start + 0.25, end))}\n${body}`;
+    })
+    .join('\n\n');
+
+  return `WEBVTT\n\n${cues}\n`;
+}

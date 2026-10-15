@@ -1,0 +1,443 @@
+import {
+  DialogueSegment,
+  WordEvent,
+  CharacterProfile,
+  SourceEngine,
+  ReviewStatus,
+  TimingStatus,
+  WhisperDisagreement
+} from '../types';
+import { generateAcousticRehearsalWav } from './elevenLabsService';
+import { evaluateTimelineDurationAlignment } from './timingEngine';
+
+export interface GeneratedDemoBundle {
+  videoFile: File;
+  videoUrl: string;
+  durationSec: number;
+  rawScribePayload: Record<string, unknown>;
+  segments: DialogueSegment[];
+  characters: CharacterProfile[];
+  sampleDisagreements: WhisperDisagreement[];
+}
+
+const DEMO_SCRIPT = [
+  {
+    speaker_id: 'speaker_0',
+    character_id: 'char_dara',
+    character_name: 'Inspector Dara',
+    voice_id: 'pNInz6obpgDQGcFmaJgB',
+    start: 0.6,
+    end: 3.8,
+    text: 'Wait right there! Did you bring the ancient temple map from Siem Reap?',
+    translated_text: 'ឈប់នៅទីនោះសិន! តើអ្នកបានយកផែនទីប្រាសាទបុរាណពីសៀមរាបមកទេ?',
+    literal_meaning: 'Stop right there first! Did you bring the ancient temple map from Siem Reap?',
+    natural_spoken_version: 'ឈប់សិនអូន! បានយកផែនទីប្រាសាទបុរាណពីសៀមរាបមកអត់ហ្នឹង?',
+    shorter_dubbing_version: 'ឈប់សិន! បានយកផែនទីពីសៀមរាបមកទេ?',
+    emotion_direction: 'Urgent, hushed authority',
+    delivery_notes: 'Sharp pause after ឈប់សិនអូន, rising questioning tone on មកអត់ហ្នឹង',
+    audio_events: ['[footsteps]'],
+    freq: 145
+  },
+  {
+    speaker_id: 'speaker_1',
+    character_id: 'char_sophea',
+    character_name: 'Dr. Sophea',
+    voice_id: 'EXAVITQu4vr4xnSDxMaL',
+    start: 4.3,
+    end: 7.7,
+    text: 'Keep your voice down, Dara. Someone has been following me since dawn.',
+    translated_text: 'បន្ថយសំឡេងបន្តិចតារា។ មានគេតាមខ្ញុំតាំងពីព្រឹកព្រលឹមមកម្ល៉េះ។',
+    literal_meaning: 'Lower your voice a bit Dara. Someone followed me since early dawn.',
+    natural_spoken_version: 'តិចៗបងតារា! មានគេលួចតាមខ្ញុំតាំងពីព្រលឹមម្ល៉េះណា៎។',
+    shorter_dubbing_version: 'តិចៗបងតារា! មានគេតាមខ្ញុំតាំងពីព្រលឹម។',
+    emotion_direction: 'Tense, secretive whisper',
+    delivery_notes: 'Quick hushed opening on តិចៗបងតារា, anxious emphasis on តាំងពីព្រលឹម',
+    audio_events: ['[tense breathing]'],
+    freq: 220
+  },
+  {
+    speaker_id: 'speaker_0',
+    character_id: 'char_dara',
+    character_name: 'Inspector Dara',
+    voice_id: 'pNInz6obpgDQGcFmaJgB',
+    start: 8.2,
+    end: 11.4,
+    text: 'If the artifact falls into their hands, we will lose everything tonight.',
+    translated_text: 'បើវត្ថុបុរាណធ្លាក់ក្នុងដៃពួកគេ យើងនឹងបាត់បង់អ្វីៗទាំងអស់នៅយប់នេះ។',
+    literal_meaning: 'If the ancient object falls into their hands, we will lose everything tonight.',
+    natural_spoken_version: 'បើវត្ថុបុរាណធ្លាក់ក្នុងដៃពួកវា យប់នេះពួកយើងចប់អស់ហើយ។',
+    shorter_dubbing_version: 'បើធ្លាក់ក្នុងដៃពួកវា យប់នេះយើងចប់ហើយ។',
+    emotion_direction: 'Grave, high-stakes tension',
+    delivery_notes: 'Firm stress on ធ្លាក់ក្នុងដៃពួកវា, solemn finality on ចប់អស់ហើយ',
+    audio_events: [],
+    freq: 150
+  },
+  {
+    speaker_id: 'speaker_2',
+    character_id: 'char_vannak',
+    character_name: 'Master Vannak',
+    voice_id: 'onwK4e9ZLuTAKqWW03F9',
+    start: 11.9,
+    end: 15.4,
+    text: 'Then trust each other, my friends. The gates of Angkor only open before sunrise.',
+    translated_text: 'ដូច្នេះសូមទុកចិត្តគ្នាទៅមិត្តទាំងឡាយ។ ទ្វារអង្គរបើកតែមុនថ្ងៃរះប៉ុណ្ណោះ។',
+    literal_meaning: 'So trust each other my friends. The gates of Angkor open only before sunrise.',
+    natural_spoken_version: 'អ៊ីចឹងត្រូវទុកចិត្តគ្នាណា៎ក្មួយ។ ទ្វារអង្គរបើកតែមុនថ្ងៃរះទេ។',
+    shorter_dubbing_version: 'ត្រូវទុកចិត្តគ្នាណា៎ក្មួយ ទ្វារអង្គរបើកមុនថ្ងៃរះទេ។',
+    emotion_direction: 'Calm, wise elder reassurance',
+    delivery_notes: 'Warm elder kinship pronoun ក្មួយ, measured pause before ទ្វារអង្គរ',
+    audio_events: ['[distant thunder]'],
+    freq: 115
+  }
+];
+
+export async function generatePlayableDemoMovie(
+  onProgress?: (msg: string) => void
+): Promise<GeneratedDemoBundle> {
+  const durationSec = 16;
+  const width = 854;
+  const height = 480;
+  const fps = 30;
+
+  onProgress?.('Preparing playable test movie & multi-speaker audio tracks...');
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+
+  const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+  const dest = audioCtx.createMediaStreamDestination();
+
+  const now = audioCtx.currentTime;
+  const ambientOsc = audioCtx.createOscillator();
+  const ambientGain = audioCtx.createGain();
+  ambientOsc.type = 'sine';
+  ambientOsc.frequency.setValueAtTime(55, now);
+  ambientGain.gain.setValueAtTime(0.03, now);
+  ambientOsc.connect(ambientGain);
+  ambientGain.connect(dest);
+  ambientOsc.start(now);
+  ambientOsc.stop(now + durationSec);
+
+  DEMO_SCRIPT.forEach((line) => {
+    const words = line.text.split(' ');
+    const wordDur = (line.end - line.start) / words.length;
+    words.forEach((_, idx) => {
+      const wStart = now + line.start + idx * wordDur;
+      const wEnd = wStart + wordDur * 0.82;
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = 'triangle';
+      const pitchMod = line.freq + ((idx % 4) * 14);
+      osc.frequency.setValueAtTime(pitchMod, wStart);
+      g.gain.setValueAtTime(0.001, wStart);
+      g.gain.linearRampToValueAtTime(0.18, wStart + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.008, wEnd);
+      osc.connect(g);
+      g.connect(dest);
+      osc.start(wStart);
+      osc.stop(wEnd);
+    });
+  });
+
+  const canvasStream = canvas.captureStream(fps);
+  const combinedStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...dest.stream.getAudioTracks()
+  ]);
+
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+    ? 'video/webm;codecs=vp9,opus'
+    : 'video/webm';
+
+  const recorder = new MediaRecorder(combinedStream, { mimeType });
+  const chunks: BlobPart[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+
+  recorder.start(100);
+
+  const startWall = performance.now();
+  const renderDurationMs = 2200;
+
+  await new Promise<void>((resolve) => {
+    const drawFrame = () => {
+      const elapsedMs = performance.now() - startWall;
+      const simTime = (elapsedMs / renderDurationMs) * durationSec;
+
+      const grad = ctx.createLinearGradient(0, 0, width, height);
+      grad.addColorStop(0, '#0D131F');
+      grad.addColorStop(0.5, '#181326');
+      grad.addColorStop(1, '#090D16');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.fillStyle = '#1E293B';
+      ctx.fillRect(0, height - 110, width, 110);
+      for (let i = 0; i < 5; i++) {
+        const towerX = 170 + i * 130;
+        const towerH = i === 2 ? 150 : i % 2 === 1 ? 115 : 85;
+        ctx.fillStyle = '#D4AF3722';
+        ctx.beginPath();
+        ctx.moveTo(towerX - 35, height - 110);
+        ctx.lineTo(towerX, height - 110 - towerH);
+        ctx.lineTo(towerX + 35, height - 110);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      const activeLine = DEMO_SCRIPT.find((l) => simTime >= l.start && simTime <= l.end);
+
+      ctx.fillStyle = '#D4AF37';
+      ctx.font = '600 13px "JetBrains Mono", monospace';
+      ctx.fillText(`ANGKORDUB REEL // TC 00:00:${simTime.toFixed(2).padStart(5, '0')}`, 28, 36);
+
+      const chars = [
+        { id: 'char_dara', name: 'Inspector Dara', x: 210, color: '#38BDF8' },
+        { id: 'char_sophea', name: 'Dr. Sophea', x: 427, color: '#F472B6' },
+        { id: 'char_vannak', name: 'Master Vannak', x: 644, color: '#FBBF24' }
+      ];
+
+      chars.forEach((c) => {
+        const isSpeaking = activeLine?.character_id === c.id;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(c.x, 215, isSpeaking ? 52 : 44, 0, Math.PI * 2);
+        ctx.fillStyle = isSpeaking ? `${c.color}33` : '#1E293B88';
+        ctx.fill();
+        ctx.lineWidth = isSpeaking ? 3 : 1.5;
+        ctx.strokeStyle = isSpeaking ? c.color : '#475569';
+        ctx.stroke();
+
+        ctx.fillStyle = '#F8FAFC';
+        ctx.beginPath();
+        ctx.arc(c.x - 14, 204, 4, 0, Math.PI * 2);
+        ctx.arc(c.x + 14, 204, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        const mouthOpen = isSpeaking ? 4 + Math.abs(Math.sin(simTime * 18)) * 12 : 2;
+        ctx.fillStyle = isSpeaking ? '#F43F5E' : '#64748B';
+        ctx.beginPath();
+        ctx.ellipse(c.x, 230, 14, mouthOpen, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = isSpeaking ? '#F8FAFC' : '#94A3B8';
+        ctx.font = '600 13px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(c.name, c.x, 290);
+        ctx.restore();
+      });
+
+      if (elapsedMs < renderDurationMs) {
+        requestAnimationFrame(drawFrame);
+      } else {
+        recorder.stop();
+        resolve();
+      }
+    };
+    requestAnimationFrame(drawFrame);
+  });
+
+  await new Promise<void>((resolve) => {
+    recorder.onstop = () => resolve();
+  });
+
+  await audioCtx.close();
+
+  const videoBlob = new Blob(chunks, { type: mimeType });
+  const videoFile = new File([videoBlob], 'angkor_temple_expedition_reel.webm', { type: mimeType });
+  const videoUrl = URL.createObjectURL(videoFile);
+
+  const allWords: Record<string, unknown>[] = [];
+  const rawSegments: DialogueSegment[] = [];
+
+  for (let sIdx = 0; sIdx < DEMO_SCRIPT.length; sIdx++) {
+    const item = DEMO_SCRIPT[sIdx];
+    const segId = `seg_${sIdx + 1}`;
+    const rawWords = item.text.split(' ');
+    const wordDur = Number(((item.end - item.start) / rawWords.length).toFixed(3));
+
+    const wordEvents: WordEvent[] = rawWords.map((w, wIdx) => {
+      const wStart = Number((item.start + wIdx * wordDur).toFixed(3));
+      const wEnd = Number((wIdx === rawWords.length - 1 ? item.end : wStart + wordDur * 0.92).toFixed(3));
+      const wObj: WordEvent = {
+        word_id: `w_${sIdx + 1}_${wIdx + 1}`,
+        segment_id: segId,
+        speaker_id: item.speaker_id,
+        start: wStart,
+        end: wEnd,
+        original_text: w,
+        language: 'en',
+        word_type: 'word',
+        confidence: Number((0.94 + ((wIdx % 5) * 0.01)).toFixed(2)),
+        source_engine: SourceEngine.SCRIBE_V2,
+        review_status: ReviewStatus.VERIFIED
+      };
+      allWords.push({
+        text: w,
+        start: wStart,
+        end: wEnd,
+        type: 'word',
+        speaker_id: item.speaker_id,
+        confidence: wObj.confidence
+      });
+      return wObj;
+    });
+
+    const availableDuration = Number((item.end - item.start).toFixed(3));
+
+    // Pre-generate measurable audio clip for immediate audition & assembly verification
+    const synthClip = await generateAcousticRehearsalWav(
+      item.shorter_dubbing_version,
+      item.voice_id
+    );
+
+    rawSegments.push({
+      segment_id: segId,
+      speaker_id: item.speaker_id,
+      character_id: item.character_id,
+      source_start: item.start,
+      source_end: item.end,
+      available_duration: availableDuration,
+      source_timing_locked: true,
+      proposed_dubbed_start: item.start,
+      proposed_dubbed_end: Number((item.start + synthClip.actualDurationSeconds).toFixed(3)),
+      actual_synthesized_duration: synthClip.actualDurationSeconds,
+      final_approved_start: item.start,
+      final_approved_end: Number((item.start + synthClip.actualDurationSeconds).toFixed(3)),
+      playback_rate_adjustment: 1.0,
+      original_text: item.text,
+      language: 'en',
+      target_language: 'km',
+      word_events: wordEvents,
+      audio_events: item.audio_events,
+      translated_text: item.translated_text,
+      literal_meaning: item.literal_meaning,
+      natural_spoken_version: item.natural_spoken_version,
+      shorter_dubbing_version: item.shorter_dubbing_version,
+      selected_version_type: 'natural',
+      active_target_text: item.natural_spoken_version,
+      emotion_direction: item.emotion_direction,
+      delivery_notes: item.delivery_notes,
+      pronunciation_notes: '',
+      estimated_speech_duration: Number((availableDuration * 0.92).toFixed(2)),
+      source_engine: SourceEngine.SCRIBE_V2,
+      review_status: ReviewStatus.VERIFIED,
+      review_required: false,
+      review_reason: '',
+      timing_status: TimingStatus.PASSED,
+      overlap_seconds: 0,
+      needs_retranslation: false,
+      needs_resynthesis: false,
+      synthesized_audio_base64: synthClip.audioBase64,
+      synthesized_audio_mime: synthClip.mimeType,
+      synthesized_voice_id: item.voice_id,
+      synthesized_engine_used: 'local_acoustic_fallback',
+      is_locked_approved: false
+    });
+  }
+
+  const segments = evaluateTimelineDurationAlignment(rawSegments).updatedSegments;
+
+  const characters: CharacterProfile[] = [
+    {
+      character_id: 'char_dara',
+      original_speaker_id: 'speaker_0',
+      character_name: 'Inspector Dara',
+      first_appearance: 0.6,
+      dialogue_count: 2,
+      voice_description: 'Authoritative Cambodian detective, mid-30s, urgent baritone',
+      perceived_vocal_presentation: 'Adult Male (Baritone, Urgent)',
+      relationship_context: 'Longtime trusted colleague of Dr. Sophea; respects Master Vannak',
+      assigned_voice_id: 'pNInz6obpgDQGcFmaJgB',
+      assigned_voice_name: 'Adam (Deep Cinematic Multilingual)',
+      is_voice_locked: true,
+      target_language_compatibility: 'verified_multilingual_v2',
+      pronunciation_notes: 'Use "បង" (Bong) when addressing Sophea warmly or urgency particles "ទេ/ណា៎"',
+      voice_consistency_notes: 'Keep stability at 0.55 for natural urgency',
+      audition_audio_base64: null,
+      review_status: ReviewStatus.APPROVED
+    },
+    {
+      character_id: 'char_sophea',
+      original_speaker_id: 'speaker_1',
+      character_name: 'Dr. Sophea',
+      first_appearance: 4.3,
+      dialogue_count: 1,
+      voice_description: 'Lead archaeologist, sharp, cautious, hushed intensity',
+      perceived_vocal_presentation: 'Adult Female (Clear, Tense)',
+      relationship_context: 'Equal partner to Inspector Dara, protective of the temple map',
+      assigned_voice_id: 'EXAVITQu4vr4xnSDxMaL',
+      assigned_voice_name: 'Sarah (Expressive Multilingual)',
+      is_voice_locked: true,
+      target_language_compatibility: 'verified_multilingual_v2',
+      pronunciation_notes: 'Natural Phnom Penh conversational cadence; avoid stiff formal pronouns',
+      voice_consistency_notes: 'Slightly lower volume for secretive scene context',
+      audition_audio_base64: null,
+      review_status: ReviewStatus.APPROVED
+    },
+    {
+      character_id: 'char_vannak',
+      original_speaker_id: 'speaker_2',
+      character_name: 'Master Vannak',
+      first_appearance: 11.9,
+      dialogue_count: 1,
+      voice_description: 'Elder temple guardian, calm, wise, resonant delivery',
+      perceived_vocal_presentation: 'Senior Male (Resonant, Calm)',
+      relationship_context: 'Mentor figure to both Dara and Sophea',
+      assigned_voice_id: 'onwK4e9ZLuTAKqWW03F9',
+      assigned_voice_name: 'Daniel (Warm Elder Mentor)',
+      is_voice_locked: true,
+      target_language_compatibility: 'verified_multilingual_v2',
+      pronunciation_notes: 'Warm elder tone, respectful phrasing around Angkor',
+      voice_consistency_notes: 'Measured pacing with natural pause after comma',
+      audition_audio_base64: null,
+      review_status: ReviewStatus.APPROVED
+    }
+  ];
+
+  const sampleDisagreements: WhisperDisagreement[] = [
+    {
+      id: 'dis_1',
+      segment_id: 'seg_1',
+      timestamp_start: 2.8,
+      timestamp_end: 3.8,
+      scribe_text: 'Wait right there! Did you bring the ancient temple map from Siem Reap?',
+      whisper_text: 'Wait right there! Did you bring the ancient temple map from Seam Rip?',
+      disagreement_type: 'proper_name',
+      proposed_correction: 'Wait right there! Did you bring the ancient temple map from Siem Reap?',
+      resolved: false
+    },
+    {
+      id: 'dis_2',
+      segment_id: 'seg_4',
+      timestamp_start: 11.9,
+      timestamp_end: 15.4,
+      scribe_text: 'Then trust each other, my friends. The gates of Angkor only open before sunrise.',
+      whisper_text: 'Then trust each other my friends, the gates of Anchor only open before sunrise.',
+      disagreement_type: 'proper_name',
+      proposed_correction: 'Then trust each other, my friends. The gates of Angkor only open before sunrise.',
+      resolved: false
+    }
+  ];
+
+  const rawScribePayload = {
+    model_id: 'scribe_v2',
+    language_code: 'eng',
+    language_probability: 0.99,
+    text: DEMO_SCRIPT.map((d) => d.text).join(' '),
+    words: allWords
+  };
+
+  return {
+    videoFile,
+    videoUrl,
+    durationSec,
+    rawScribePayload,
+    segments,
+    characters,
+    sampleDisagreements
+  };
+}

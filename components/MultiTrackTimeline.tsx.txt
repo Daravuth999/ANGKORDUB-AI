@@ -1,0 +1,906 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  Lock,
+  Unlock,
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  ZoomIn,
+  ZoomOut,
+  Scissors,
+  Merge,
+  Undo2,
+  Redo2,
+  Magnet,
+  SkipBack,
+  SkipForward,
+  Maximize2,
+  Minimize2,
+  Edit3
+} from 'lucide-react';
+import { DialogueSegment, CharacterProfile, TimingStatus } from '../types';
+
+interface MultiTrackTimelineProps {
+  segments: DialogueSegment[];
+  characters: CharacterProfile[];
+  durationSec: number;
+  currentTimeSec: number;
+  selectedSegmentId: string | null;
+  selectedSegmentIds: string[];
+  canUndo: boolean;
+  canRedo: boolean;
+  hasUnsavedTimelineEdits: boolean;
+  onSelectSegment: (segmentId: string, multiSelect?: boolean) => void;
+  onSeek: (timeSec: number) => void;
+  onUpdateSegmentTiming: (
+    segmentId: string,
+    newStart: number,
+    newEnd: number,
+    target: 'dubbed' | 'source'
+  ) => void;
+  onSplitSegmentAtPlayhead: (segmentId: string, splitTimeSec: number) => void;
+  onMergeSelectedSegments: () => void;
+  onReassignSpeaker: (segmentId: string, newCharacterId: string) => void;
+  onInlineEditSegmentText: (
+    segmentId: string,
+    field: 'original_text' | 'active_target_text',
+    value: string
+  ) => void;
+  onToggleSourceLock: (segmentId: string) => void;
+  onUndo: () => void;
+  onRedo: () => void;
+}
+
+const SPEAKER_BADGE_COLORS: Record<string, string> = {
+  speaker_0: 'bg-sky-500/25 border-sky-400 text-sky-200',
+  speaker_1: 'bg-pink-500/25 border-pink-400 text-pink-200',
+  speaker_2: 'bg-amber-500/25 border-amber-400 text-amber-200',
+  speaker_3: 'bg-purple-500/25 border-purple-400 text-purple-200'
+};
+
+export const MultiTrackTimeline: React.FC<MultiTrackTimelineProps> = ({
+  segments,
+  characters,
+  durationSec,
+  currentTimeSec,
+  selectedSegmentId,
+  selectedSegmentIds,
+  canUndo,
+  canRedo,
+  hasUnsavedTimelineEdits,
+  onSelectSegment,
+  onSeek,
+  onUpdateSegmentTiming,
+  onSplitSegmentAtPlayhead,
+  onMergeSelectedSegments,
+  onReassignSpeaker,
+  onInlineEditSegmentText,
+  onToggleSourceLock,
+  onUndo,
+  onRedo
+}) => {
+  // Zoom in pixels per second: default 48 px/sec so 62 segments never overlap into unreadable pills
+  const [pixelsPerSecond, setPixelsPerSecond] = useState<number>(48);
+  const [snapEnabled, setSnapEnabled] = useState<boolean>(true);
+  const [isExpandedHeight, setIsExpandedHeight] = useState<boolean>(false);
+  const [editingCell, setEditingCell] = useState<{
+    segmentId: string;
+    field: 'original_text' | 'active_target_text';
+    draft: string;
+  } | null>(null);
+
+  // Pointer drag state for moving or resizing clips horizontally
+  const [dragState, setDragState] = useState<{
+    segmentId: string;
+    mode: 'move' | 'resize_left' | 'resize_right';
+    target: 'dubbed' | 'source';
+    initialX: number;
+    initialStart: number;
+    initialEnd: number;
+    currentStart: number;
+    currentEnd: number;
+  } | null>(null);
+
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const safeDuration = Math.max(durationSec, 16);
+  const totalCanvasWidthPx = Math.max(900, Math.ceil(safeDuration * pixelsPerSecond) + 120);
+
+  const selectedSegment = segments.find((s) => s.segment_id === selectedSegmentId) || null;
+
+  // Auto-scroll timeline to keep playhead in view during playback
+  useEffect(() => {
+    if (!scrollContainerRef.current || dragState) return;
+    const container = scrollContainerRef.current;
+    const playheadX = currentTimeSec * pixelsPerSecond;
+    const viewLeft = container.scrollLeft;
+    const viewRight = viewLeft + container.clientWidth;
+
+    if (playheadX < viewLeft + 40 || playheadX > viewRight - 60) {
+      container.scrollLeft = Math.max(0, playheadX - container.clientWidth * 0.35);
+    }
+  }, [currentTimeSec, pixelsPerSecond, dragState]);
+
+  // Global pointer move / up listeners during clip drag/resize
+  useEffect(() => {
+    if (!dragState) return;
+
+    const handlePointerMove = (e: PointerEvent) => {
+      const deltaPx = e.clientX - dragState.initialX;
+      const deltaSec = deltaPx / pixelsPerSecond;
+      const clipDur = dragState.initialEnd - dragState.initialStart;
+
+      let nextStart = dragState.initialStart;
+      let nextEnd = dragState.initialEnd;
+
+      if (dragState.mode === 'move') {
+        nextStart = Math.max(0, Math.min(safeDuration - clipDur, dragState.initialStart + deltaSec));
+        nextEnd = nextStart + clipDur;
+      } else if (dragState.mode === 'resize_left') {
+        nextStart = Math.max(0, Math.min(dragState.initialEnd - 0.25, dragState.initialStart + deltaSec));
+      } else if (dragState.mode === 'resize_right') {
+        nextEnd = Math.max(dragState.initialStart + 0.25, Math.min(safeDuration, dragState.initialEnd + deltaSec));
+      }
+
+      if (snapEnabled) {
+        const snapPoints = [0, currentTimeSec];
+        segments.forEach((s) => {
+          if (s.segment_id !== dragState.segmentId) {
+            snapPoints.push(s.source_start, s.source_end, s.final_approved_start, s.final_approved_end);
+          }
+        });
+        for (const pt of snapPoints) {
+          if (Math.abs(nextStart - pt) < 0.12) {
+            const diff = pt - nextStart;
+            nextStart = pt;
+            if (dragState.mode === 'move') nextEnd += diff;
+            break;
+          }
+          if (Math.abs(nextEnd - pt) < 0.12) {
+            const diff = pt - nextEnd;
+            nextEnd = pt;
+            if (dragState.mode === 'move') nextStart += diff;
+            break;
+          }
+        }
+      }
+
+      setDragState((prev) =>
+        prev
+          ? {
+              ...prev,
+              currentStart: Number(nextStart.toFixed(2)),
+              currentEnd: Number(nextEnd.toFixed(2))
+            }
+          : null
+      );
+    };
+
+    const handlePointerUp = () => {
+      if (dragState) {
+        onUpdateSegmentTiming(
+          dragState.segmentId,
+          dragState.currentStart,
+          dragState.currentEnd,
+          dragState.target
+        );
+      }
+      setDragState(null);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [dragState, pixelsPerSecond, safeDuration, snapEnabled, currentTimeSec, segments, onUpdateSegmentTiming]);
+
+  const handleRulerClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (dragState) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const clickX = Math.max(0, e.clientX - rect.left);
+    const targetSec = Math.min(safeDuration, clickX / pixelsPerSecond);
+    onSeek(Number(targetSec.toFixed(2)));
+  };
+
+  // Adaptive ruler tick interval so numbers never overlap at any zoom level
+  const tickStepSec =
+    pixelsPerSecond >= 90 ? 1 : pixelsPerSecond >= 40 ? 2 : pixelsPerSecond >= 20 ? 5 : 10;
+  const tickCount = Math.ceil(safeDuration / tickStepSec) + 1;
+
+  const jumpToAdjacentSegment = (direction: 'prev' | 'next') => {
+    if (segments.length === 0) return;
+    const currentIndex = segments.findIndex((s) => s.segment_id === selectedSegmentId);
+    const nextIdx =
+      direction === 'next'
+        ? Math.min(segments.length - 1, currentIndex + 1)
+        : Math.max(0, currentIndex - 1);
+    const target = segments[nextIdx];
+    if (target) {
+      onSelectSegment(target.segment_id);
+      onSeek(target.source_start);
+    }
+  };
+
+  return (
+    <div
+      className={`bg-[#0B0D13] border-t border-[#262B3D] select-none flex flex-col shrink-0 transition-all ${
+        isExpandedHeight ? 'h-96' : 'h-72'
+      }`}
+    >
+      {/* Top Timeline Studio Toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-[#131722] border-b border-[#262B3D] text-[11px]">
+        <div className="flex items-center gap-2">
+          <span className="font-mono font-bold text-[#D4AF37] flex items-center gap-1.5">
+            <Clock className="w-3.5 h-3.5" />
+            8-TRACK DAW TIMELINE
+          </span>
+
+          {/* Undo / Redo */}
+          <div className="flex items-center bg-[#0B0C10] rounded-md border border-[#262B3D] p-0.5">
+            <button
+              onClick={onUndo}
+              disabled={!canUndo}
+              className="p-1 rounded hover:bg-white/10 text-slate-300 disabled:opacity-35"
+              title="Undo Timeline Edit (Ctrl+Z)"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onRedo}
+              disabled={!canRedo}
+              className="p-1 rounded hover:bg-white/10 text-slate-300 disabled:opacity-35"
+              title="Redo Timeline Edit (Ctrl+Y)"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Segment Step Navigation */}
+          <div className="flex items-center bg-[#0B0C10] rounded-md border border-[#262B3D] p-0.5">
+            <button
+              onClick={() => jumpToAdjacentSegment('prev')}
+              className="p-1 rounded hover:bg-white/10 text-slate-300"
+              title="Previous Segment"
+            >
+              <SkipBack className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => jumpToAdjacentSegment('next')}
+              className="p-1 rounded hover:bg-white/10 text-slate-300"
+              title="Next Segment"
+            >
+              <SkipForward className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Split & Merge Segment Tools */}
+          <button
+            onClick={() => {
+              if (selectedSegment) {
+                onSplitSegmentAtPlayhead(selectedSegment.segment_id, currentTimeSec);
+              }
+            }}
+            disabled={!selectedSegment}
+            className="px-2 py-1 rounded bg-[#1A1F2E] hover:bg-[#252B3F] border border-[#2E364F] text-slate-200 flex items-center gap-1 disabled:opacity-40"
+            title="Split selected segment at current playhead position"
+          >
+            <Scissors className="w-3 h-3 text-sky-400" />
+            <span>Split</span>
+          </button>
+
+          <button
+            onClick={onMergeSelectedSegments}
+            disabled={selectedSegmentIds.length < 2 && !selectedSegment}
+            className="px-2 py-1 rounded bg-[#1A1F2E] hover:bg-[#252B3F] border border-[#2E364F] text-slate-200 flex items-center gap-1 disabled:opacity-40"
+            title="Merge selected segment with next adjacent segment (or Shift+Click multiple)"
+          >
+            <Merge className="w-3 h-3 text-amber-400" />
+            <span>Merge Next</span>
+          </button>
+
+          {/* Snap Toggle */}
+          <button
+            onClick={() => setSnapEnabled(!snapEnabled)}
+            className={`px-2 py-1 rounded border flex items-center gap-1 ${
+              snapEnabled
+                ? 'bg-[#D4AF37]/20 border-[#D4AF37]/50 text-[#D4AF37]'
+                : 'bg-[#0B0C10] border-[#262B3D] text-slate-400'
+            }`}
+            title="Toggle Magnetic Snapping to Segment Boundaries"
+          >
+            <Magnet className="w-3 h-3" />
+            <span>Snap</span>
+          </button>
+
+          {hasUnsavedTimelineEdits && (
+            <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[10px]">
+              ✓ Edits Synced to IndexedDB
+            </span>
+          )}
+        </div>
+
+        {/* Numeric Timing Inspector for Selected Clip + Zoom Controls */}
+        <div className="flex items-center gap-3">
+          {selectedSegment && (
+            <div className="hidden lg:flex items-center gap-1.5 bg-[#0B0C10] px-2.5 py-1 rounded border border-[#262B3D] font-mono text-[10px]">
+              <span className="text-[#D4AF37] font-semibold">{selectedSegment.segment_id}:</span>
+              <span className="text-slate-400">Dub Start</span>
+              <input
+                type="number"
+                step="0.05"
+                min={0}
+                max={safeDuration}
+                value={selectedSegment.proposed_dubbed_start}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  const dur = selectedSegment.proposed_dubbed_end - selectedSegment.proposed_dubbed_start;
+                  onUpdateSegmentTiming(selectedSegment.segment_id, val, val + dur, 'dubbed');
+                }}
+                className="w-14 bg-[#161924] border border-[#2C3347] rounded px-1 py-0.5 text-white text-center"
+              />
+              <span className="text-slate-400">End</span>
+              <input
+                type="number"
+                step="0.05"
+                min={0.25}
+                max={safeDuration}
+                value={selectedSegment.proposed_dubbed_end}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  onUpdateSegmentTiming(
+                    selectedSegment.segment_id,
+                    selectedSegment.proposed_dubbed_start,
+                    val,
+                    'dubbed'
+                  );
+                }}
+                className="w-14 bg-[#161924] border border-[#2C3347] rounded px-1 py-0.5 text-white text-center"
+              />
+              <button
+                onClick={() => onToggleSourceLock(selectedSegment.segment_id)}
+                className="ml-1 px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 text-sky-300 flex items-center gap-1"
+                title="Lock or unlock Scribe source timing anchor for this segment"
+              >
+                {selectedSegment.source_timing_locked !== false ? (
+                  <>
+                    <Lock className="w-2.5 h-2.5" /> Src Locked
+                  </>
+                ) : (
+                  <>
+                    <Unlock className="w-2.5 h-2.5 text-amber-300" /> Src Unlocked
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+
+          {/* Horizontal Zoom Slider */}
+          <div className="flex items-center gap-1.5 bg-[#0B0C10] px-2 py-1 rounded border border-[#262B3D]">
+            <button
+              onClick={() => setPixelsPerSecond((z) => Math.max(15, z - 12))}
+              className="text-slate-400 hover:text-white"
+              title="Zoom Out Timeline"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            <input
+              type="range"
+              min={15}
+              max={140}
+              value={pixelsPerSecond}
+              onChange={(e) => setPixelsPerSecond(Number(e.target.value))}
+              className="w-20 accent-[#D4AF37]"
+              title={`Zoom: ${pixelsPerSecond} px/sec`}
+            />
+            <button
+              onClick={() => setPixelsPerSecond((z) => Math.min(140, z + 12))}
+              className="text-slate-400 hover:text-white"
+              title="Zoom In Timeline"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <span className="font-mono text-[10px] text-slate-400 w-12 text-right">
+              {pixelsPerSecond}px/s
+            </span>
+          </div>
+
+          <button
+            onClick={() => setIsExpandedHeight(!isExpandedHeight)}
+            className="p-1 rounded bg-[#0B0C10] border border-[#262B3D] text-slate-300 hover:text-white"
+            title={isExpandedHeight ? 'Compact Timeline Height' : 'Expand Timeline Height'}
+          >
+            {isExpandedHeight ? (
+              <Minimize2 className="w-3.5 h-3.5" />
+            ) : (
+              <Maximize2 className="w-3.5 h-3.5" />
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Main 8-Track Scrollable Workspace */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left Sticky Track Header Column */}
+        <div className="w-48 shrink-0 bg-[#12151E] border-r border-[#262B3D] flex flex-col text-[10px] font-medium text-slate-300 overflow-y-hidden">
+          <div className="h-6 px-3 flex items-center justify-between bg-[#0E1118] border-b border-[#222738] font-mono text-[9px] text-slate-400">
+            <span>TIMECODE RULER</span>
+            <span>{safeDuration.toFixed(1)}s</span>
+          </div>
+          <div className="flex-1 flex flex-col justify-between divide-y divide-[#1E2330]">
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-slate-300">1. Original Video</span>
+              <span className="font-mono text-[9px] text-slate-500">V1</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-slate-300">2. Source Audio</span>
+              <span className="font-mono text-[9px] text-slate-500">A1</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-sky-300 flex items-center gap-1">
+                <Lock className="w-2.5 h-2.5" /> 3. Scribe Transcript
+              </span>
+              <span className="font-mono text-[9px] text-sky-400">SRC</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span>4. Speaker Diarization</span>
+              <span className="font-mono text-[9px] text-slate-500">SPK</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-[#D4AF37]">5. Khmer Dialogue</span>
+              <span className="font-mono text-[9px] text-[#D4AF37]">LOC</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-emerald-300">6. Dubbed Audio Clips</span>
+              <span className="font-mono text-[9px] text-emerald-400">DUB</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-purple-300">7. Dual Subtitles</span>
+              <span className="font-mono text-[9px] text-purple-400">SUB</span>
+            </div>
+            <div className="px-3 flex-1 flex items-center justify-between">
+              <span className="text-amber-300">8. Timing & QA Markers</span>
+              <span className="font-mono text-[9px] text-amber-400">GATE</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Horizontally Scrollable Multi-Track Canvas */}
+        <div
+          ref={scrollContainerRef}
+          className="flex-1 overflow-x-auto overflow-y-hidden relative bg-[#0B0C10]"
+        >
+          <div
+            style={{ width: `${totalCanvasWidthPx}px` }}
+            className="h-full flex flex-col relative"
+          >
+            {/* Non-Overlapping Adaptive Timecode Ruler */}
+            <div
+              onClick={handleRulerClick}
+              className="h-6 bg-[#0E1118] border-b border-[#222738] relative cursor-pointer shrink-0"
+            >
+              {Array.from({ length: tickCount }).map((_, idx) => {
+                const sec = idx * tickStepSec;
+                if (sec > safeDuration + tickStepSec) return null;
+                const leftPx = sec * pixelsPerSecond;
+                return (
+                  <div
+                    key={sec}
+                    style={{ left: `${leftPx}px` }}
+                    className="absolute top-0 bottom-0 border-l border-slate-700/70 pl-1 flex items-center pointer-events-none"
+                  >
+                    <span className="text-[9px] font-mono text-slate-400 whitespace-nowrap">
+                      {sec}s
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 8 Track Lanes Container */}
+            <div
+              onClick={handleRulerClick}
+              className="flex-1 flex flex-col justify-between divide-y divide-[#1A1F2E]"
+            >
+              {/* Track 1: Original Video Stream Bar */}
+              <div className="relative flex-1 bg-[#0E121B]/60 flex items-center">
+                <div
+                  style={{ width: `${safeDuration * pixelsPerSecond}px` }}
+                  className="h-4/5 rounded bg-gradient-to-r from-indigo-950/70 via-slate-900/70 to-indigo-950/70 border border-indigo-500/30 px-2 flex items-center justify-between text-[9px] font-mono text-indigo-200 pointer-events-none"
+                >
+                  <span>SOURCE VIDEO STREAM (LOCKED FRAME SYNC)</span>
+                  <span>{safeDuration.toFixed(2)}s</span>
+                </div>
+              </div>
+
+              {/* Track 2: Original Audio Waveform Envelope */}
+              <div className="relative flex-1 bg-[#0C0F17]/60 flex items-center">
+                {segments.map((seg) => {
+                  const leftPx = seg.source_start * pixelsPerSecond;
+                  const widthPx = Math.max(18, (seg.source_end - seg.source_start) * pixelsPerSecond);
+                  return (
+                    <div
+                      key={`wave_${seg.segment_id}`}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className="absolute top-1 bottom-1 rounded bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-around px-1 overflow-hidden pointer-events-none"
+                    >
+                      {Array.from({ length: Math.min(16, Math.max(3, Math.floor(widthPx / 10))) }).map(
+                        (_, bIdx) => (
+                          <span
+                            key={bIdx}
+                            style={{ height: `${35 + ((bIdx * 23) % 55)}%` }}
+                            className="w-0.5 bg-cyan-400/60 rounded-full"
+                          />
+                        )
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Track 3: Scribe Source Transcript (Double-click to inline edit, drag when unlocked) */}
+              <div className="relative flex-1">
+                {segments.map((seg) => {
+                  const isDraggingThis =
+                    dragState?.segmentId === seg.segment_id && dragState.target === 'source';
+                  const startSec = isDraggingThis ? dragState.currentStart : seg.source_start;
+                  const endSec = isDraggingThis ? dragState.currentEnd : seg.source_end;
+                  const leftPx = startSec * pixelsPerSecond;
+                  const widthPx = Math.max(28, (endSec - startSec) * pixelsPerSecond);
+                  const isSelected = seg.segment_id === selectedSegmentId;
+                  const isLocked = seg.source_timing_locked !== false;
+
+                  return (
+                    <div
+                      key={`src_${seg.segment_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id, e.shiftKey);
+                        onSeek(seg.source_start);
+                      }}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({
+                          segmentId: seg.segment_id,
+                          field: 'original_text',
+                          draft: seg.original_text
+                        });
+                      }}
+                      onPointerDown={(e) => {
+                        if (isLocked || editingCell) return;
+                        e.stopPropagation();
+                        setDragState({
+                          segmentId: seg.segment_id,
+                          mode: 'move',
+                          target: 'source',
+                          initialX: e.clientX,
+                          initialStart: seg.source_start,
+                          initialEnd: seg.source_end,
+                          currentStart: seg.source_start,
+                          currentEnd: seg.source_end
+                        });
+                      }}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded px-1.5 flex items-center justify-between text-[10px] truncate border transition-colors ${
+                        isSelected
+                          ? 'bg-sky-500/35 border-sky-300 text-white z-10'
+                          : 'bg-slate-800/85 border-slate-600/80 text-slate-200 hover:border-slate-400'
+                      }`}
+                      title={`[${startSec.toFixed(2)}s - ${endSec.toFixed(2)}s] Double-click to edit transcript inline: ${seg.original_text}`}
+                    >
+                      <span className="truncate">{seg.original_text}</span>
+                      <Edit3 className="w-2.5 h-2.5 opacity-50 shrink-0 ml-1" />
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Track 4: Speaker Assignments (Inline Dropdown Reassignment) */}
+              <div className="relative flex-1">
+                {segments.map((seg) => {
+                  const leftPx = seg.source_start * pixelsPerSecond;
+                  const widthPx = Math.max(36, (seg.source_end - seg.source_start) * pixelsPerSecond);
+                  const badgeStyle =
+                    SPEAKER_BADGE_COLORS[seg.speaker_id] || SPEAKER_BADGE_COLORS.speaker_0;
+
+                  return (
+                    <div
+                      key={`spk_${seg.segment_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id, e.shiftKey);
+                      }}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded px-1 flex items-center border ${badgeStyle}`}
+                    >
+                      <select
+                        value={seg.character_id}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => onReassignSpeaker(seg.segment_id, e.target.value)}
+                        className="w-full bg-transparent text-[10px] font-medium truncate focus:outline-none cursor-pointer"
+                      >
+                        {characters.map((c) => (
+                          <option
+                            key={c.character_id}
+                            value={c.character_id}
+                            className="bg-[#12151E] text-white"
+                          >
+                            {c.character_name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Track 5: Translated Khmer Dialogue (Double-click to inline edit) */}
+              <div className="relative flex-1">
+                {segments.map((seg) => {
+                  const leftPx = seg.proposed_dubbed_start * pixelsPerSecond;
+                  const widthPx = Math.max(
+                    28,
+                    (seg.proposed_dubbed_end - seg.proposed_dubbed_start) * pixelsPerSecond
+                  );
+                  const isSelected = seg.segment_id === selectedSegmentId;
+
+                  return (
+                    <div
+                      key={`loc_${seg.segment_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id, e.shiftKey);
+                      }}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({
+                          segmentId: seg.segment_id,
+                          field: 'active_target_text',
+                          draft: seg.active_target_text || seg.natural_spoken_version
+                        });
+                      }}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded px-1.5 flex items-center justify-between text-[10px] font-['Kantumruy_Pro',sans-serif] truncate border ${
+                        isSelected
+                          ? 'bg-[#D4AF37]/30 border-[#D4AF37] text-white z-10'
+                          : 'bg-amber-950/40 border-amber-500/40 text-amber-100 hover:border-amber-400'
+                      }`}
+                      title="Double-click to edit Khmer dialogue inline"
+                    >
+                      <span className="truncate">
+                        {seg.active_target_text || seg.natural_spoken_version || '(Unlocalized)'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Track 6: Draggable & Resizable Generated Dubbed Audio Clips */}
+              <div className="relative flex-1">
+                {segments.map((seg) => {
+                  const isDraggingThis =
+                    dragState?.segmentId === seg.segment_id && dragState.target === 'dubbed';
+                  const startSec = isDraggingThis
+                    ? dragState.currentStart
+                    : seg.proposed_dubbed_start;
+                  const effectiveDur =
+                    seg.actual_synthesized_duration !== null
+                      ? seg.actual_synthesized_duration / (seg.playback_rate_adjustment || 1.0)
+                      : seg.proposed_dubbed_end - seg.proposed_dubbed_start;
+                  const endSec = isDraggingThis
+                    ? dragState.currentEnd
+                    : startSec + effectiveDur;
+
+                  const leftPx = startSec * pixelsPerSecond;
+                  const widthPx = Math.max(28, (endSec - startSec) * pixelsPerSecond);
+
+                  let clipColor = 'bg-slate-800/60 border-dashed border-slate-600 text-slate-400';
+                  if (seg.actual_synthesized_duration !== null) {
+                    if (seg.timing_status === TimingStatus.PASSED) {
+                      clipColor = 'bg-emerald-500/30 border-emerald-400 text-emerald-100';
+                    } else if (seg.timing_status === TimingStatus.WARNING) {
+                      clipColor = 'bg-amber-500/30 border-amber-400 text-amber-100';
+                    } else if (seg.timing_status === TimingStatus.OVERFLOW_FAILED) {
+                      clipColor = 'bg-rose-500/35 border-rose-500 text-rose-100';
+                    }
+                  }
+
+                  return (
+                    <div
+                      key={`dub_${seg.segment_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id, e.shiftKey);
+                      }}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id, e.shiftKey);
+                        setDragState({
+                          segmentId: seg.segment_id,
+                          mode: 'move',
+                          target: 'dubbed',
+                          initialX: e.clientX,
+                          initialStart: startSec,
+                          initialEnd: endSec,
+                          currentStart: startSec,
+                          currentEnd: endSec
+                        });
+                      }}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`group absolute top-0.5 bottom-0.5 rounded px-2 flex items-center justify-between text-[10px] font-mono truncate border cursor-grab active:cursor-grabbing ${clipColor}`}
+                      title={`Drag horizontally to adjust timing or drag edges to trim [${startSec.toFixed(2)}s - ${endSec.toFixed(2)}s]`}
+                    >
+                      {/* Left Resize Handle */}
+                      <div
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          setDragState({
+                            segmentId: seg.segment_id,
+                            mode: 'resize_left',
+                            target: 'dubbed',
+                            initialX: e.clientX,
+                            initialStart: startSec,
+                            initialEnd: endSec,
+                            currentStart: startSec,
+                            currentEnd: endSec
+                          });
+                        }}
+                        className="absolute left-0 top-0 bottom-0 w-1.5 bg-white/20 hover:bg-[#D4AF37] cursor-ew-resize"
+                      />
+
+                      <span className="truncate">
+                        {seg.segment_id}{' '}
+                        {seg.actual_synthesized_duration !== null
+                          ? `(${(endSec - startSec).toFixed(2)}s)`
+                          : '(Est)'}
+                      </span>
+
+                      {/* Right Resize Handle */}
+                      <div
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          setDragState({
+                            segmentId: seg.segment_id,
+                            mode: 'resize_right',
+                            target: 'dubbed',
+                            initialX: e.clientX,
+                            initialStart: startSec,
+                            initialEnd: endSec,
+                            currentStart: startSec,
+                            currentEnd: endSec
+                          });
+                        }}
+                        className="absolute right-0 top-0 bottom-0 w-1.5 bg-white/20 hover:bg-[#D4AF37] cursor-ew-resize"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Track 7: Synchronized Subtitle Cues */}
+              <div className="relative flex-1">
+                {segments.map((seg) => {
+                  const leftPx = seg.final_approved_start * pixelsPerSecond;
+                  const widthPx = Math.max(
+                    24,
+                    (seg.final_approved_end - seg.final_approved_start) * pixelsPerSecond
+                  );
+                  return (
+                    <div
+                      key={`sub_${seg.segment_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id);
+                        onSeek(seg.final_approved_start);
+                      }}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className="absolute top-0.5 bottom-0.5 rounded bg-purple-500/20 border border-purple-400/40 px-1.5 flex items-center text-[9px] text-purple-200 truncate"
+                    >
+                      CC: {seg.active_target_text || seg.original_text}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Track 8: Non-Overlapping Timing Status & QA Markers */}
+              <div className="relative flex-1">
+                {segments.map((seg) => {
+                  const leftPx = seg.source_start * pixelsPerSecond;
+                  const widthPx = Math.max(24, (seg.source_end - seg.source_start) * pixelsPerSecond);
+                  return (
+                    <div
+                      key={`gate_${seg.segment_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectSegment(seg.segment_id);
+                      }}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className="absolute top-0.5 bottom-0.5 flex items-center justify-center overflow-hidden px-0.5"
+                    >
+                      {seg.timing_status === TimingStatus.PASSED && (
+                        <span className="w-full text-center truncate px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono text-[9px]">
+                          PASS
+                        </span>
+                      )}
+                      {seg.timing_status === TimingStatus.WARNING && (
+                        <span className="w-full text-center truncate px-1 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono text-[9px]">
+                          WARN {seg.playback_rate_adjustment}x
+                        </span>
+                      )}
+                      {seg.timing_status === TimingStatus.OVERFLOW_FAILED && (
+                        <span className="w-full text-center truncate px-1 py-0.5 rounded bg-rose-500/25 text-rose-200 border border-rose-500/50 font-mono text-[9px]">
+                          +{seg.overlap_seconds.toFixed(1)}s
+                        </span>
+                      )}
+                      {seg.timing_status === TimingStatus.UNMEASURED && (
+                        <span className="w-full text-center truncate text-slate-600 font-mono text-[9px]">
+                          •
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Playhead Cursor */}
+            <div
+              style={{ left: `${currentTimeSec * pixelsPerSecond}px` }}
+              className="absolute top-0 bottom-0 w-0.5 bg-[#D4AF37] pointer-events-none z-30"
+            >
+              <div className="w-2.5 h-2.5 -ml-[4px] bg-[#D4AF37] rotate-45 rounded-xs shadow" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Inline Dialogue / Transcript Edit Modal Popover */}
+      {editingCell && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="bg-[#12151E] border border-[#D4AF37] rounded-xl max-w-lg w-full p-4 space-y-3 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-mono font-bold text-[#D4AF37]">
+                INLINE TIMELINE EDIT ({editingCell.segmentId} —{' '}
+                {editingCell.field === 'original_text' ? 'Source Transcript' : 'Khmer Dialogue'})
+              </span>
+              <button
+                onClick={() => setEditingCell(null)}
+                className="text-xs text-slate-400 hover:text-white"
+              >
+                Cancel
+              </button>
+            </div>
+            <textarea
+              rows={3}
+              autoFocus
+              value={editingCell.draft}
+              onChange={(e) => setEditingCell({ ...editingCell, draft: e.target.value })}
+              className="w-full p-3 rounded-lg bg-[#0B0C10] border border-[#2C3347] text-sm text-white font-['Kantumruy_Pro',sans-serif] focus:outline-none focus:border-[#D4AF37]"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setEditingCell(null)}
+                className="px-3 py-1.5 rounded-lg text-xs text-slate-300 hover:bg-white/5"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  onInlineEditSegmentText(
+                    editingCell.segmentId,
+                    editingCell.field,
+                    editingCell.draft
+                  );
+                  setEditingCell(null);
+                }}
+                className="px-4 py-1.5 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-bold"
+              >
+                Apply Edit & Mark Affected Downstream
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
