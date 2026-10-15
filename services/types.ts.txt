@@ -1,8 +1,6 @@
 export enum SourceEngine {
   SCRIBE_V2 = 'elevenlabs_scribe_v2',
-  WHISPER_V3 = 'whisper_compatible',
-  GEMINI_AUDIO_FALLBACK = 'gemini_audio_diarization_fallback',
-  DEMO_SAMPLE = 'verified_sample_fixture'
+  WHISPER_V3 = 'whisper_compatible'
 }
 
 export enum ReviewStatus {
@@ -39,8 +37,6 @@ export enum AudioMixMode {
   REPLACE_ORIGINAL = 'replace_original',
   DIALOGUE_ONLY = 'dialogue_only'
 }
-
-export type TtsEngineMode = 'elevenlabs_with_fallback' | 'elevenlabs_strict' | 'local_acoustic_synth';
 
 export type PipelineStageStatus =
   | 'waiting'
@@ -140,7 +136,7 @@ export interface DialogueSegment {
   synthesized_audio_base64: string | null;
   synthesized_audio_mime: string | null;
   synthesized_voice_id: string | null;
-  synthesized_engine_used?: 'elevenlabs' | 'local_acoustic_fallback';
+  synthesized_engine_used?: 'elevenlabs';
   is_locked_approved: boolean;
 }
 
@@ -204,8 +200,6 @@ export interface ApiCredentials {
   whisperModel: string;
   persistLocally: boolean;
   elevenLabsTtsModel: string;
-  ttsEngineMode: TtsEngineMode;
-  enableScribeFallbackToGemini: boolean;
   enableWhisperVerification: boolean;
   lipSyncEndpointUrl: string;
 }
